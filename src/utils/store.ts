@@ -84,6 +84,10 @@ function sanitize(raw: any): PersistedState {
               Number.isFinite(t.amountUsdt) &&
               Number.isFinite(t.price)
           )
+          .map((t: any) => ({
+            ...t,
+            userId: Number.isFinite(t.userId) ? t.userId : undefined,
+          }))
           .slice(-MAX_TRADES)
       : [],
     settledKeys: toStringArray(risk.settledKeys, MAX_KEYS),

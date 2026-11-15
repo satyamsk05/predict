@@ -1,10 +1,10 @@
 import type { Bot, Context } from 'grammy';
-import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { predictFunApi } from '../exchanges/predictfun/api.js';
 import { stateStore } from '../utils/store.js';
 import { walletInfo } from '../config/index.js';
 import { portfolioUrl, addressUrl, linkLine } from '../bot/links.js';
+import { userRegistry } from '../users/registry.js';
 
 /**
  * Deposit watcher: polls the wallet's USDT / BNB balances and notifies
@@ -77,7 +77,8 @@ async function poll(bot: Bot<Context>) {
       .filter(Boolean)
       .join('\n');
 
-    for (const userId of config.telegram.allowedUsers) {
+    // Notify every approved member (multi-user club mode).
+    for (const userId of userRegistry.activeIds()) {
       await bot.api.sendMessage(userId, lines, { parse_mode: 'HTML' }).catch((e) => {
         logger.warn({ err: e, userId }, 'Deposit notify failed');
       });

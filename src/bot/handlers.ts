@@ -29,6 +29,7 @@ import {
 } from '../services/autoServices.js';
 import { parseBetText } from './betText.js';
 import { marketUrl, portfolioUrl, addressUrl, linkLine } from './links.js';
+import { userRegistry } from '../users/registry.js';
 
 type BetDraft = {
   outcome?: 'UP' | 'DOWN';
@@ -118,12 +119,147 @@ function fmtPct(p: PositionPnl): string {
 function isAllowed(ctx: Context): boolean {
   const userId = ctx.from?.id;
   if (!userId) return false;
+  // Open mode (no whitelist configured) — single-owner behaviour unchanged.
   if (config.telegram.allowedUsers.length === 0) return true;
-  return config.telegram.allowedUsers.includes(userId);
+  // Multi-user club mode: approved members + admins only.
+  return userRegistry.hasAccess(userId);
 }
 
-function notAllowed(ctx: Context) {
-  return ctx.reply('⛔ You are not authorized to use this bot.');
+/**
+ * Unauthorised user → file an access request (max 10 members) and ping the
+ * admins with an /approve hint. Idempotent: pending users get a gentle nudge.
+ */
+async function notAllowed(ctx: Context) {
+  const userId = ctx.from?.id;
+  if (!userId) return ctx.reply('⛔ You are not authorized to use this bot.');
+
+  const result = await userRegistry.requestAccess(userId, ctx.from?.username);
+
+  if (result === 'active') {
+    // Race: approved between the check and here — just continue.
+    return;
+  }
+  if (result === 'pending') {
+    return ctx.reply(
+      '⏳ <b>Access request already pending.</b>\nAdmin approval ka wait karo — approve hote hi message milega.',
+      { parse_mode: 'HTML' }
+    );
+  }
+  return ctx.reply(
+    [
+      '⛔ <b>Bot full hai</b>',
+      ``,
+      `Is bot par max <b>${userRegistry.maxUsers()} members</b> allowed hain aur sab slots bhar chuke hain.`,
+      `Owner se contact karo agar koi slot khulwana hai.`,
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
+}
+
+// ───────────────────────────────────────────────
+// Admin commands — /approve, /users, /kick (max 10 members)
+// ───────────────────────────────────────────────
+function adminGate(ctx: Context): boolean {
+  const userId = ctx.from?.id;
+  if (!userId) return false;
+  if (config.telegram.allowedUsers.length === 0) return true; // open mode = owner
+  return userRegistry.isAdmin(userId);
+}
+
+export async function handleApprove(ctx: Context) {
+  if (!adminGate(ctx)) return notAllowed(ctx);
+
+  const id = Number((ctx.message?.text || '').split(/\s+/)[1]);
+  if (!Number.isFinite(id) || id <= 0) {
+    const pending = userRegistry.all().filter((u) => u.status === 'pending');
+    const lines = pending.length
+      ? ['🆕 <b>Pending requests:</b>', '']
+      : ['🆕 <b>Pending requests:</b> koi nahi', ''];
+    for (const u of pending) {
+      lines.push(`• ${u.username ? '@' + u.username : 'anon'} — <code>${u.telegramId}</code>`);
+    }
+    lines.push('', `Usage: <code>/approve &lt;userId&gt;</code>`);
+    return ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  }
+
+  const approved = userRegistry.approve(id);
+  if (!approved) {
+    return ctx.reply(`❌ <code>${id}</code> ke liye koi pending request nahi mili.`, {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
+
+  await ctx.reply(
+    `✅ <b>Approved!</b> ${approved.username ? '@' + approved.username : `id ${id}`} ab bot use kar sakta hai.`,
+    { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+  );
+  await ctx.api
+    .sendMessage(
+      id,
+      [
+        `✅ <b>Access approved!</b>`,
+        ``,
+        `Ab tum is bot se BTC 5M trading kar sakte ho.`,
+        `/start dabao aur shuru karo 🚀`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+}
+
+export async function handleUsers(ctx: Context) {
+  if (!adminGate(ctx)) return notAllowed(ctx);
+
+  const users = userRegistry.all();
+  const members = users.filter((u) => u.role === 'user');
+  const admins = users.filter((u) => u.role === 'admin');
+
+  const lines = [
+    `👥 <b>Members</b> — ${members.length}/${userRegistry.maxUsers()} slots used`,
+    '',
+  ];
+  for (const u of admins) {
+    lines.push(`👑 ${u.username ? '@' + u.username : 'admin'} — <code>${u.telegramId}</code>`);
+  }
+  for (const u of members) {
+    const s = userRegistry.getStats(u.telegramId);
+    const tag = u.status === 'pending' ? '⏳ pending' : '✅';
+    lines.push(
+      `${tag} ${u.username ? '@' + u.username : 'anon'} (<code>${u.telegramId}</code>) — ` +
+        `${s.trades} trades · PnL ${s.pnlUsd >= 0 ? '+' : ''}$${s.pnlUsd.toFixed(2)}`
+    );
+  }
+  lines.push('', `/approve &lt;id&gt; · /kick &lt;id&gt;`);
+  await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+}
+
+export async function handleKick(ctx: Context) {
+  if (!adminGate(ctx)) return notAllowed(ctx);
+
+  const id = Number((ctx.message?.text || '').split(/\s+/)[1]);
+  if (!Number.isFinite(id) || id <= 0) {
+    return ctx.reply('Usage: <code>/kick &lt;userId&gt;</code>', {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
+
+  const result = userRegistry.kick(id);
+  if (result === 'admin') {
+    return ctx.reply('👑 Admin ko kick nahi kar sakte.', { reply_markup: mainKb(ctx) });
+  }
+  if (result === 'notfound') {
+    return ctx.reply(`❌ <code>${id}</code> registry mein nahi mila.`, {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
+
+  await ctx.reply(`🚫 <code>${id}</code> ko remove kar diya.`, { reply_markup: mainKb(ctx) });
+  await ctx.api
+    .sendMessage(id, 'ℹ️ Tumhara is bot ka access admin ne remove kar diya hai.')
+    .catch(() => {});
 }
 
 const HTML = { parse_mode: 'HTML' } as const;
@@ -194,6 +330,7 @@ export async function handleHelp(ctx: Context) {
     `<b>Circuit:</b> ${stats.isTripped ? '🚨 TRIPPED' : '✅ Armed'}`,
     '',
     'Commands still work: /up 10 · /down 10 · /reset',
+    'Admin: /users · /approve <id> · /kick <id>',
     '',
     '<b>⚡ Fast typing:</b>',
     '<code>up 5 45</code> → $5 UP @ 45¢ (limit)',
@@ -565,6 +702,7 @@ async function placeOrder(
   limitPrice?: number,
   expectedMarketId?: string
 ) {
+  const userId = ctx.from?.id;
   const round = roundWatcher.getCurrentRound();
   if (!round) {
     return ctx.reply('❌ Round expired. Please start a new bet.', { reply_markup: mainKb(ctx) });
@@ -586,7 +724,20 @@ async function placeOrder(
   }
 
   const { allowed, reason } = riskManager.canTrade(amountUsdt);
-  if (!allowed) return ctx.reply(`🚫 ${reason}`, { reply_markup: mainKb(ctx) });
+  if (!allowed) {
+    return ctx.reply(`🚫 ${reason}`, { reply_markup: mainKb(ctx) });
+  }
+
+  // Per-member daily loss cap (multi-user club mode).
+  if (userId) {
+    const userCheck = userRegistry.canBet(userId);
+    if (!userCheck.allowed) {
+      return ctx.reply(`🚫 <b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
+        parse_mode: 'HTML',
+        reply_markup: mainKb(ctx),
+      });
+    }
+  }
 
   const marketPrice = outcome === 'UP' ? round.upPrice : round.downPrice;
   const price = limitPrice ?? marketPrice;
@@ -603,8 +754,10 @@ async function placeOrder(
       outcome,
       amountUsdt,
       price,
+      userId,
       settled: false,
     });
+    if (userId) userRegistry.recordBet(userId);
 
     logger.info({ marketId: round.marketId, outcome, amountUsdt, price }, '[DRY RUN] Trade recorded');
 
@@ -673,10 +826,12 @@ async function placeOrder(
         outcome,
         amountUsdt,
         price,
+        userId,
         orderId: result.orderId || result.orderHash,
         settled: false,
         filled: false,
       });
+      if (userId) userRegistry.recordBet(userId);
 
       logger.info({ marketId: round.marketId, outcome, amountUsdt, orderId: result.orderId }, 'Order placed!');
 
@@ -869,12 +1024,17 @@ export async function handleStats(ctx: Context) {
 
   const stats = riskManager.getStats();
   const btcState = btcPriceService.getState();
+  const userId = ctx.from?.id;
+  const mine = userId ? userRegistry.getStats(userId) : null;
 
   const text = [
     `📊 <b>PnL / Statistics</b>`,
     ``,
     `BTC Price: <b>$${btcState.currentPrice.toLocaleString()}</b>`,
     ``,
+    mine
+      ? `👤 <b>Aapke:</b> ${mine.trades} trades · PnL ${mine.pnlUsd >= 0 ? '+' : ''}$${mine.pnlUsd.toFixed(2)} · Aaj ka loss $${mine.dailyLossUsd.toFixed(2)}`
+      : '',
     `Today's Trades: ${stats.dailyTrades}`,
     `Today's Loss: $${stats.dailyLoss.toFixed(2)} / $${config.trading.dailyLossLimitUsdt}`,
     `Open Exposure: $${riskManager.getOpenExposureUsdt().toFixed(2)}`,
@@ -900,8 +1060,18 @@ export async function handleHistory(ctx: Context) {
     return ctx.reply('📜 No trade history yet.', { reply_markup: mainKb(ctx) });
   }
 
+  // Multi-user: show only this member's trades (admins see everything).
+  const userId = ctx.from?.id;
+  const isAdmin = userId != null && adminGate(ctx);
+  const visible = isAdmin || userId == null ? trades : trades.filter((t) => t.userId === userId);
+
+  const shown = visible.length ? visible : trades; // old trades predate attribution
+  if (shown.length === 0) {
+    return ctx.reply('📜 Abhi tak aapki koi trade nahi.', { reply_markup: mainKb(ctx) });
+  }
+
   const lines = ['📜 <b>Recent Trades</b>', ''];
-  for (const t of trades) {
+  for (const t of shown.slice(-20)) {
     const date = new Date(t.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
     const pnlStr =
       t.pnlUsd !== undefined
@@ -975,19 +1145,17 @@ async function sendKeyMessage(ctx: Context, chatId: number) {
 }
 
 export async function handleExport(ctx: Context) {
-  if (!isAllowed(ctx)) return notAllowed(ctx);
+  // The trading wallet is shared by the club — only the owner/admin may
+  // ever see its key.
+  if (!adminGate(ctx)) {
+    return ctx.reply(
+      '⛔ <b>Export admin-only hai</b> — wallet sab members ka shared trading wallet hai.',
+      { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+    );
+  }
 
   if (!config.predictfun.privateKey) {
     return ctx.reply('❌ Koi wallet configured nahi hai.', { reply_markup: mainKb(ctx) });
-  }
-
-  // Security requirement: export needs a real whitelist, otherwise ANY user
-  // who finds the bot could drain the wallet.
-  if (config.telegram.allowedUsers.length === 0) {
-    return ctx.reply(
-      '⛔ <b>/export is blocked</b>\nSecurity ke liye pehle <code>TELEGRAM_ALLOWED_USERS</code> set karo (.env) aur restart karo.',
-      { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
-    );
   }
 
   const userId = ctx.from?.id;

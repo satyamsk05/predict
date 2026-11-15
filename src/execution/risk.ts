@@ -1,6 +1,7 @@
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { stateStore } from '../utils/store.js';
+import { userRegistry } from '../users/registry.js';
 
 export interface TradeRecord {
   timestamp: number;
@@ -19,6 +20,8 @@ export interface TradeRecord {
   filled?: boolean;
   /** Set by the dry-run simulator so live settlements never touch them. */
   dryRun?: boolean;
+  /** Telegram user id for per-member PnL attribution (multi-user mode). */
+  userId?: number;
 }
 
 /** Max trades kept in memory + on disk (matches store.ts MAX_TRADES). */
@@ -200,6 +203,8 @@ class RiskManager {
       if (trade.pnlUsd < 0) {
         this.dailyLossUsd += Math.abs(trade.pnlUsd);
       }
+      // Attribute to the member who placed the bet (multi-user stats).
+      userRegistry.recordPnl(trade.userId, trade.pnlUsd);
     }
 
     if (this.dailyLossUsd >= config.trading.dailyLossLimitUsdt) {

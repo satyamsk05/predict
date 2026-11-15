@@ -33,7 +33,20 @@ Keep `DRY_RUN=true` until you trust the setup.
 auto-generates a fresh BNB trading wallet on first run and saves it to
 `data/wallet.json` (gitignored, mode 0600). It then announces the funding
 address in Telegram. Export the key anytime with `/export` (owner-only,
-2-step confirmation, requires `TELEGRAM_ALLOWED_USERS`).
+inline-button confirmation, auto-deletes after 90 seconds).
+
+### Multi-user (club mode, max 10 members)
+
+`TELEGRAM_ALLOWED_USERS` users are admins. A stranger who `/start`s the bot
+files an access request (admins get pinged); an admin approves with
+`/approve <userId>`. Up to `MAX_USERS` (default 10) members can trade from
+the shared club wallet, each with their own stats and a per-member daily
+loss cap (`USER_DAILY_LOSS_LIMIT_USDT`). Admin commands: `/users`,
+`/approve <id>`, `/kick <id>`. `/export` stays admin-only.
+
+Also included: incoming-deposit notifications (wallet balances are polled
+every 30s) and deep links (Predict.fun market/portfolio, BSCScan) on every
+trade/round/wallet message.
 
 ## Scripts
 

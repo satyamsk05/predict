@@ -11,6 +11,7 @@ import {
 import { predictSigner } from './exchanges/predictfun/signer.js';
 import { stateStore } from './utils/store.js';
 import { startDepositWatcher } from './services/depositWatcher.js';
+import { userRegistry } from './users/registry.js';
 
 /** .env holds the bot token + private key: make sure only the owner can read it. */
 function checkEnvPermissions() {
@@ -35,6 +36,10 @@ async function main() {
   logger.info(`Network: ${config.predictfun.isTestnet ? 'BNB Testnet (97)' : 'BNB Mainnet (56)'}`);
   logger.info(`Max bet: $${config.trading.maxBetUsdt} USDT`);
   logger.info(`Daily loss limit: $${config.trading.dailyLossLimitUsdt} USDT`);
+
+  // Multi-user registry: seeds env admins, loads data/users.json.
+  userRegistry.init();
+  logger.info(`Multi-user: max ${userRegistry.maxUsers()} members (admins from TELEGRAM_ALLOWED_USERS)`);
   logger.info(
     `Wallet: ${walletInfo.address} (${walletInfo.source === 'env' ? 'from .env' : walletInfo.source === 'file' ? 'from data/wallet.json' : 'auto-generated'})`
   );
@@ -72,6 +77,14 @@ async function main() {
   // Create Telegram bot
   const bot = createBot();
 
+  // Access requests → ping every active admin (works from any handler).
+  userRegistry.setNotifier(async (text: string) => {
+    for (const adminId of userRegistry.activeIds()) {
+      if (!userRegistry.isAdmin(adminId)) continue;
+      await bot.api.sendMessage(adminId, text, { parse_mode: 'HTML' }).catch(() => {});
+    }
+  });
+
   // Set bot commands menu
   await bot.api.setMyCommands([
     { command: 'start', description: '⚡ Show live BTC 5M round dashboard' },
@@ -84,6 +97,7 @@ async function main() {
     { command: 'trend', description: '📈 Orderbook / trend' },
     { command: 'reset', description: '🔄 Reset circuit breaker' },
     { command: 'export', description: '🔑 Export wallet private key (owner only)' },
+    { command: 'users', description: '👥 Member list + approvals (admin)' },
     { command: 'help', description: '❓ Show help' },
   ]);
 
@@ -96,8 +110,8 @@ async function main() {
   // Watch wallet balances and announce incoming deposits
   startDepositWatcher(bot);
 
-  // Register allowed users for push notifications
-  for (const userId of config.telegram.allowedUsers) {
+  // Register approved members for push notifications
+  for (const userId of userRegistry.activeIds()) {
     registerNotifyTarget(userId);
   }
 
@@ -114,7 +128,7 @@ async function main() {
       `🔑 Key export: <b>/export</b>`,
       `💾 Key file (server par): <code>${walletInfo.file}</code> — private rakho!`,
     ].join('\n');
-    for (const userId of config.telegram.allowedUsers) {
+    for (const userId of userRegistry.activeIds()) {
       await bot.api.sendMessage(userId, msg, { parse_mode: 'HTML' }).catch(() => {});
     }
   }
