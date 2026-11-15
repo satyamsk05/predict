@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import { logger } from './utils/logger.js';
-import { config } from './config/index.js';
+import { config, walletInfo } from './config/index.js';
 import { createBot } from './bot/bot.js';
 import {
   startAutoServices,
@@ -34,6 +34,9 @@ async function main() {
   logger.info(`Network: ${config.predictfun.isTestnet ? 'BNB Testnet (97)' : 'BNB Mainnet (56)'}`);
   logger.info(`Max bet: $${config.trading.maxBetUsdt} USDT`);
   logger.info(`Daily loss limit: $${config.trading.dailyLossLimitUsdt} USDT`);
+  logger.info(
+    `Wallet: ${walletInfo.address} (${walletInfo.source === 'env' ? 'from .env' : walletInfo.source === 'file' ? 'from data/wallet.json' : 'auto-generated'})`
+  );
 
   // Validate required env
   if (!config.telegram.token) {
@@ -79,6 +82,7 @@ async function main() {
     { command: 'history', description: '📜 Last 10 trades' },
     { command: 'trend', description: '📈 Orderbook / trend' },
     { command: 'reset', description: '🔄 Reset circuit breaker' },
+    { command: 'export', description: '🔑 Export wallet private key (owner only)' },
     { command: 'help', description: '❓ Show help' },
   ]);
 
@@ -91,6 +95,24 @@ async function main() {
   // Register allowed users for push notifications
   for (const userId of config.telegram.allowedUsers) {
     registerNotifyTarget(userId);
+  }
+
+  // Freshly auto-generated wallet: tell the owner where to send funds.
+  if (walletInfo.generated && config.telegram.allowedUsers.length > 0) {
+    const msg = [
+      `🆕 <b>New trading wallet created & saved!</b>`,
+      ``,
+      `Address: <code>${walletInfo.address}</code>`,
+      ``,
+      `1️⃣ Is address par <b>USDT (BEP-20)</b> + thoda <b>BNB</b> (gas) transfer karo.`,
+      `2️⃣ Phir ⚡ Quick Bet se trading shuru.`,
+      ``,
+      `🔑 Key export: <b>/export</b>`,
+      `💾 Key file (server par): <code>${walletInfo.file}</code> — private rakho!`,
+    ].join('\n');
+    for (const userId of config.telegram.allowedUsers) {
+      await bot.api.sendMessage(userId, msg, { parse_mode: 'HTML' }).catch(() => {});
+    }
   }
 
   // Graceful shutdown

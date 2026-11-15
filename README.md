@@ -24,8 +24,16 @@ cp .env.example .env   # fill in your values
 npm run dev
 ```
 
-Required env: `TELEGRAM_BOT_TOKEN`, `PREDICTFUN_API_KEY` (mainnet),
-`PREDICTFUN_PRIVATE_KEY`. Keep `DRY_RUN=true` until you trust the setup.
+Required env: `TELEGRAM_BOT_TOKEN`, `PREDICTFUN_API_KEY` (mainnet).
+Keep `DRY_RUN=true` until you trust the setup.
+
+### Zero-setup wallet (optional)
+
+`PREDICTFUN_PRIVATE_KEY` is optional. If you leave it empty, the bot
+auto-generates a fresh BNB trading wallet on first run and saves it to
+`data/wallet.json` (gitignored, mode 0600). It then announces the funding
+address in Telegram. Export the key anytime with `/export` (owner-only,
+2-step confirmation, requires `TELEGRAM_ALLOWED_USERS`).
 
 ## Scripts
 

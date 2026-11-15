@@ -14,6 +14,7 @@ import {
   handleOrderbook,
   handleCallbackQuery,
   handleTextMessage,
+  handleExport,
 } from './handlers.js';
 
 export function createBot() {
@@ -36,6 +37,7 @@ export function createBot() {
   bot.command('trend', handleOrderbook);
   bot.command('orderbook', handleOrderbook);
   bot.command('reset', handleReset);
+  bot.command('export', handleExport);
 
   // Legacy inline callbacks (show tip to use reply keyboard)
   bot.on('callback_query:data', handleCallbackQuery);

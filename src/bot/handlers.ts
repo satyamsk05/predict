@@ -1,5 +1,6 @@
 import type { Context } from 'grammy';
-import { config } from '../config/index.js';
+import crypto from 'node:crypto';
+import { config, walletInfo } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { roundWatcher } from '../services/roundWatcher.js';
 import { btcPriceService } from '../services/btcPrice.js';
@@ -911,6 +912,77 @@ export async function handleHistory(ctx: Context) {
   }
 
   await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+}
+
+// ───────────────────────────────────────────────
+// /export — private key via Telegram (2-step confirm, whitelist required)
+// ───────────────────────────────────────────────
+/** Per-user pending export confirmation codes (5 min expiry). */
+const pendingExports: Map<number, { code: string; expires: number }> = new Map();
+
+export async function handleExport(ctx: Context) {
+  if (!isAllowed(ctx)) return notAllowed(ctx);
+
+  if (!config.predictfun.privateKey) {
+    return ctx.reply('❌ Koi wallet configured nahi hai.', { reply_markup: mainKb(ctx) });
+  }
+
+  // Security requirement: export needs a real whitelist, otherwise ANY user
+  // who finds the bot could drain the wallet.
+  if (config.telegram.allowedUsers.length === 0) {
+    return ctx.reply(
+      '⛔ <b>/export is blocked</b>\nSecurity ke liye pehle <code>TELEGRAM_ALLOWED_USERS</code> set karo (.env) aur restart karo.',
+      { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+    );
+  }
+
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const parts = (ctx.message?.text || '').split(/\s+/);
+  const pending = pendingExports.get(userId);
+
+  if (parts[1] === 'confirm') {
+    const code = (parts[2] || '').trim();
+    if (pending && pending.code === code && Date.now() < pending.expires) {
+      pendingExports.delete(userId);
+      logger.warn({ userId }, 'Private key exported via Telegram /export');
+      return ctx.reply(
+        [
+          '🔑 <b>PRIVATE KEY — HANDLE WITH CARE</b>',
+          ``,
+          `Address: <code>${esc(walletInfo.address)}</code>`,
+          `Key: <code>${esc(config.predictfun.privateKey)}</code>`,
+          ``,
+          `⚠️ <b>Ye message ABHI delete kar do</b> — chat history mein key rahegi warna.`,
+          `⚠️ Ye key wallet ko drain kar sakti hai — kisi se share mat karo.`,
+          `ℹ️ Import karne ke liye: MetaMask / Rabby / Trust Wallet → "Import account".`,
+        ].join('\n'),
+        { parse_mode: 'HTML' }
+      );
+    }
+    return ctx.reply('❌ Invalid ya expired code. Naya code ke liye <code>/export</code> chalao.', {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
+
+  const code = String(crypto.randomInt(100_000, 1_000_000));
+  pendingExports.set(userId, { code, expires: Date.now() + 5 * 60_000 });
+  return ctx.reply(
+    [
+      '⚠️ <b>Private key export — confirm karo</b>',
+      ``,
+      `Ye action tumhari <b>private key</b> is Telegram chat mein bhej dega.`,
+      `Confirm karne ke liye ye bhejo:`,
+      ``,
+      `<code>/export confirm ${code}</code>`,
+      ``,
+      `⏳ Code 5 minute mein expire ho jayega.`,
+      `ℹ️ Wallet: <code>${esc(walletInfo.address)}</code> (${walletInfo.source === 'env' ? '.env' : walletInfo.file})`,
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
 }
 
 // ───────────────────────────────────────────────

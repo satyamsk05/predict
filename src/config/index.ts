@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { logger } from '../utils/logger.js';
+import { resolveWallet } from './wallet.js';
 
 dotenv.config();
 
@@ -71,17 +72,9 @@ const allowedUsers = allowedUsersRaw
 
 const isTestnet = process.env.PREDICTFUN_TESTNET === 'true';
 
-const rawPrivateKey = (process.env.PREDICTFUN_PRIVATE_KEY || '').trim();
-let privateKey = rawPrivateKey;
-if (privateKey) {
-  const hex = privateKey.replace(/^0x/i, '');
-  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
-    logger.error('PREDICTFUN_PRIVATE_KEY is not a valid 32-byte hex private key — ignoring it.');
-    privateKey = '';
-  } else if (!privateKey.startsWith('0x')) {
-    privateKey = `0x${hex}`;
-  }
-}
+// Wallet bootstrap: env key > data/wallet.json > auto-generate a fresh one.
+const walletBoot = resolveWallet(process.env.PREDICTFUN_PRIVATE_KEY || '');
+const privateKey = walletBoot.privateKey;
 
 export const config: AppConfig = {
   telegram: {
@@ -91,8 +84,7 @@ export const config: AppConfig = {
   predictfun: {
     apiKey: (process.env.PREDICTFUN_API_KEY || '').trim(),
     privateKey,
-    predictAccount: (process.env.PREDICTFUN_ACCOUNT || '').trim(),
-    isTestnet,
+    predictAccount: (process.env.PREDICTFUN_ACCOUNT || '').trim(),    isTestnet,
     baseUrl: isTestnet
       ? 'https://api-testnet.predict.fun/v1'
       : 'https://api.predict.fun/v1',
@@ -121,4 +113,15 @@ export const config: AppConfig = {
     ),
     autoRedeem: parseBool(process.env.AUTO_REDEEM, true),
   },
+};
+
+/** Exported so the Telegram bot can announce / export the wallet. */
+export const walletInfo = {
+  address: walletBoot.address,
+  source: walletBoot.source,
+  generated: walletBoot.source === 'generated',
+  /** File location hint for owner messages (matches utils/store defaults). */
+  file: process.env.DATA_DIR
+    ? `${process.env.DATA_DIR.replace(/[\\/]+$/, '')}/wallet.json`
+    : 'data/wallet.json',
 };

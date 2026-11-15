@@ -1,0 +1,13 @@
+Auto wallet creation + Telegram key export (/export)
+
+Zero-setup flow: start the bot without PREDICTFUN_PRIVATE_KEY and it
+generates a fresh BNB trading wallet on first boot, saves it to
+data/wallet.json (gitignored, mode 0600), and announces the funding address
+in Telegram. The owner exports the key anytime via /export.
+
+- config/wallet.ts: resolve priority env key > wallet.json > generate
+- /export: owner-only, requires TELEGRAM_ALLOWED_USERS, 2-step confirmation
+  (random 6-digit code, 5-min expiry) before the key is sent to the chat
+- Startup: wallet source logged; new wallets announced to whitelisted users
+  with funding instructions (USDT BEP-20 + BNB gas)
+- /export added to the command menu; README + .env.example updated
