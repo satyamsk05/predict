@@ -26,6 +26,7 @@ import {
   isNotifyPaused,
 } from '../services/autoServices.js';
 import { parseBetText } from './betText.js';
+import { marketUrl, portfolioUrl, addressUrl, linkLine } from './links.js';
 
 type BetDraft = {
   outcome?: 'UP' | 'DOWN';
@@ -326,6 +327,7 @@ async function showConfirm(
     `Est. Payout: <b>$${payout.toFixed(2)} USDT</b> (before fees)`,
     `Est. Profit: <b>+$${profit.toFixed(2)} USDT</b> (${((profit / amountUsdt) * 100).toFixed(1)}%)`,
     feePct > 0 ? `ℹ️ Market fee: ${feePct.toFixed(2)}%` : '',
+    linkLine(marketUrl(round.roundSlug), 'Open market'),
     isLimit
       ? belowMarket
         ? `⏳ Below market (${(marketPrice * 100).toFixed(0)}¢) — order book mein lagega, fill hone par position banegi.`
@@ -433,6 +435,7 @@ async function showPositionDetail(ctx: Context, key: string) {
     `📦 <b>Position</b>`,
     ``,
     `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+    linkLine(marketUrl(pos.slug), 'Open market'),
     `Outcome: ${outcomeToSide(pos.outcome) === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
     `Shares: <b>${pos.shares.toFixed(4)}</b>`,
     entry > 0 ? `Entry: ${(entry * 100).toFixed(1)}¢` : '',
@@ -529,6 +532,7 @@ async function closePosition(ctx: Context, key: string) {
         `Proceeds: ~$${q.value.toFixed(2)} USDT`,
         `Profit: <b>${fmtPnl(q)}</b> (${fmtPct(q)}) <i>(before fees)</i>`,
         `Order: <code>${result.orderId || result.orderHash || 'N/A'}</code>`,
+        linkLine(marketUrl(pos.slug), 'Open market'),
         ``,
         config.trading.dryRun ? '' : 'ℹ️ Fill hone ke baad 📦 Open se confirm kar lena.',
       ]
@@ -681,6 +685,7 @@ async function placeOrder(
           `Outcome: ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
           `Amount: $${amountUsdt.toFixed(2)} USDT`,
           `Order ID: <code>${result.orderId || result.orderHash || 'N/A'}</code>`,
+          linkLine(marketUrl(round.roundSlug), 'Open market'),
           ``,
           `⏳ Fill confirm ho raha hai…`,
         ].join('\n'),
@@ -776,7 +781,10 @@ export async function handleBalance(ctx: Context) {
         `USDT: <b>$${usdt.toFixed(2)}</b>`,
         `BNB:  <b>${bnb.toFixed(4)} BNB</b> (gas)`,
         address ? `\nAddress: <code>${address}</code>` : '',
+        linkLine(portfolioUrl(address), 'Portfolio on Predict.fun'),
+        linkLine(addressUrl(address), 'View on BSCScan'),
       ]
+        .filter(Boolean)
         .join('\n')
         .trim(),
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }

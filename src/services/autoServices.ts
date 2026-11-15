@@ -9,6 +9,7 @@ import type { Bot, Context } from 'grammy';
 import type { ActiveRoundState } from '../services/roundWatcher.js';
 import type { PredictPosition } from '../exchanges/predictfun/types.js';
 import { esc } from '../bot/keyboards.js';
+import { marketUrl, txUrl, linkLine } from '../bot/links.js';
 import { stateStore } from '../utils/store.js';
 
 interface NotifyTarget {
@@ -261,11 +262,14 @@ export function startAutoServices(bot: Bot<Context>) {
                 [
                   `🧪 <b>[DRY RUN] Settled</b>`,
                   `Market: ${esc(market.title || market.question || marketId)}`,
+                  linkLine(marketUrl((market as any).slug), 'Open market'),
                   `Bet: ${trade.outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} $${trade.amountUsdt.toFixed(2)} @ ${(trade.price * 100).toFixed(0)}¢`,
                   `Result: ${result === 'WON' ? '✅ WON' : result === 'LOST' ? '❌ LOST' : '↩️ REFUND'}`,
                   `PnL: <b>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</b>`,
                   `Today's loss: $${riskManager.getStats().dailyLoss} / $${config.trading.dailyLossLimitUsdt}`,
-                ].join('\n')
+                ]
+                  .filter(Boolean)
+                  .join('\n')
               );
             }
           }
@@ -379,8 +383,12 @@ export function startAutoServices(bot: Bot<Context>) {
                   `✅ <b>Position Redeemed!</b>`,
                   `Market: ${esc(pos.marketTitle || pos.marketId)}`,
                   `Outcome: ${esc(pos.outcome)}`,
-                  `TX: <code>${result.txHash || 'N/A'}</code>`,
-                ].join('\n')
+                  txUrl(result.txHash)
+                    ? `TX: <a href="${txUrl(result.txHash)}">${result.txHash!.slice(0, 10)}…${result.txHash!.slice(-6)}</a> ↗`
+                    : `TX: <code>${result.txHash || 'N/A'}</code>`,
+                ]
+                  .filter(Boolean)
+                  .join('\n')
               );
             } catch (e: any) {
               // One bad position must not stall the rest of the cycle.

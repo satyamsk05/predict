@@ -1,5 +1,6 @@
 import { InlineKeyboard, Keyboard } from 'grammy';
 import { config } from '../config/index.js';
+import { marketUrl, linkLine } from './links.js';
 import type { ActiveRoundState } from '../services/roundWatcher.js';
 
 /** Persistent main menu — ReplyKeyboard (keyword buttons) */
@@ -81,6 +82,7 @@ export function buildRoundCard(round: ActiveRoundState, balance?: number): strin
   const dryRun = config.trading.dryRun ? '\n🧪 <b>DRY RUN MODE</b> — No real orders' : '';
   const balanceLine =
     balance !== undefined ? `\n💼 <b>Balance:</b> $${esc(formatPrice(balance))} USDT` : '';
+  const marketLink = linkLine(marketUrl(round.roundSlug), 'Open market on Predict.fun');
 
   return (
     `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -93,7 +95,7 @@ export function buildRoundCard(round: ActiveRoundState, balance?: number): strin
     `📊 <b>Odds:</b>\n` +
     `🟢 UP   : ${(round.upPrice * 100).toFixed(0)}¢  →  <b>${esc(upPayout)}x payout</b>\n` +
     `🔴 DOWN : ${(round.downPrice * 100).toFixed(0)}¢  →  <b>${esc(downPayout)}x payout</b>` +
-    `${balanceLine}${lockWarning}${dryRun}`
+    `${marketLink}${balanceLine}${lockWarning}${dryRun}`
   );
 }
 

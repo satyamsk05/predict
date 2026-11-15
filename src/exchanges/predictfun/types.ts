@@ -32,6 +32,8 @@ export interface PredictMarket {
   category?: string;
   categorySlug?: string;
   seriesSlug?: string;
+  /** URL slug used by the web UI: predict.fun/market/<slug> */
+  slug?: string;
   status?: string;
   tradingStatus?: string;
   endsAt?: string;
@@ -62,6 +64,8 @@ export interface PredictPosition {
   marketId: string;
   marketTitle?: string;
   conditionId?: string;
+  /** Web UI slug for deep links (predict.fun/market/<slug>) */
+  slug?: string;
   outcome: string;
   tokenId: string;
   shares: number;
