@@ -1,9 +1,0 @@
-Deposit notifications + export inline buttons + 90s key auto-delete
-
-- New depositWatcher: polls wallet USDT/BNB every 30s, notifies whitelisted
-  users on incoming funds (baseline persisted in state.json so deposits made
-  while the bot was offline still get announced)
-- /export now shows a Polymarket-style card with inline buttons
-  (Yes, Export / Cancel); the old /export confirm <code> path still works
-- The private-key message auto-deletes after 90 seconds via deleteMessage
-- PersistedState gains an optional deposit section (sanitized on load)
