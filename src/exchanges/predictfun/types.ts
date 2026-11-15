@@ -94,11 +94,14 @@ export interface PredictSeriesRound {
   markets: PredictMarket[];
 }
 
-/** Buy price for an outcome: prefer best ask, then explicit price, then best bid. */
+/**
+ * Buy price for an outcome: prefer best ask, then explicit price.
+ * The best bid is deliberately NOT used as a fallback: a BUY limit priced at
+ * the bid sits below the ask and can never fill.
+ */
 export function outcomeBuyPrice(outcome?: PredictMarketOutcome | null): number | undefined {
   if (!outcome) return undefined;
   if (outcome.bestAsk?.price && outcome.bestAsk.price > 0) return outcome.bestAsk.price;
   if (typeof outcome.price === 'number' && outcome.price > 0) return outcome.price;
-  if (outcome.bestBid?.price && outcome.bestBid.price > 0) return outcome.bestBid.price;
   return undefined;
 }

@@ -109,8 +109,11 @@ class PredictFunApi {
     if (config.predictfun.privateKey) {
       try {
         const provider = new ethers.JsonRpcProvider(config.predictfun.rpcUrl);
-        // Faster tx confirmation polling on BNB
-        (provider as any).pollingInterval = 300;
+        // Public RPCs rate-limit hard; keep polling reasonable (override with
+        // RPC_POLLING_MS, e.g. 300 for a private endpoint).
+        const pollingMs = Number(process.env.RPC_POLLING_MS || 1000);
+        (provider as any).pollingInterval =
+          Number.isFinite(pollingMs) && pollingMs >= 100 ? Math.round(pollingMs) : 1000;
         this.wallet = new Wallet(config.predictfun.privateKey, provider);
       } catch (e) {
         logger.warn('Could not initialize wallet with provided private key');
@@ -416,16 +419,18 @@ class PredictFunApi {
   }
 
   /**
-   * Get user USDT balance on BNB Chain
+   * Get user USDT balance on BNB Chain.
+   * `ok` distinguishes "genuinely zero" from "RPC failed" — callers must not
+   * treat a failed fetch as an empty wallet.
    */
-  public async getBalance(): Promise<{ usdt: number; bnb: number }> {
+  public async getBalance(): Promise<{ usdt: number; bnb: number; ok: boolean }> {
     if (!this.wallet) {
-      return { usdt: 0, bnb: 0 };
+      return { usdt: 0, bnb: 0, ok: false };
     }
 
     try {
       const provider = this.wallet.provider;
-      if (!provider) return { usdt: 0, bnb: 0 };
+      if (!provider) return { usdt: 0, bnb: 0, ok: false };
 
       // Gas always sits on the signing EOA; funds may sit on the Predict Account.
       const fundingAddress = this.getEffectiveAddress() || this.wallet.address;
@@ -452,10 +457,10 @@ class PredictFunApi {
       ]);
 
       const usdt = parseFloat(ethers.formatUnits(usdtBalRaw, decimals));
-      return { usdt, bnb };
+      return { usdt, bnb, ok: true };
     } catch (e) {
       logger.error({ err: e }, 'Failed to fetch on-chain balances');
-      return { usdt: 0, bnb: 0 };
+      return { usdt: 0, bnb: 0, ok: false };
     }
   }
 

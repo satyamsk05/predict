@@ -1,6 +1,7 @@
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { btcPriceService } from './btcPrice.js';
+import { pythPriceService } from './pythPrice.js';
 import { predictFunApi } from '../exchanges/predictfun/api.js';
 import { outcomeBuyPrice, type PredictMarket } from '../exchanges/predictfun/types.js';
 
@@ -18,9 +19,20 @@ export interface ActiveRoundState {
   upPrice: number;
   downPrice: number;
   isLocked: boolean;
+  /** True for the API-outage placeholder — notifications and bets are suppressed. */
+  synthetic?: boolean;
   rawMarket?: PredictMarket;
   seriesSlug?: string;
   roundSlug?: string;
+}
+
+/**
+ * Best available BTC price, in settlement-parity order:
+ * 1. Pyth (the oracle Predict.fun actually settles against)
+ * 2. Binance spot (fallback while Pyth is cold/unreachable)
+ */
+function bestBtcPrice(): number {
+  return pythPriceService.getPrice() || btcPriceService.getPrice();
 }
 
 function findOutcome(market: PredictMarket, side: 'UP' | 'DOWN') {
@@ -42,6 +54,7 @@ class RoundWatcher {
   private consecutiveRefreshFailures = 0;
 
   constructor() {
+    pythPriceService.start();
     this.refreshRound();
     this.checkInterval = setInterval(() => this.tick(), 1000);
   }
@@ -82,9 +95,9 @@ class RoundWatcher {
       return;
     }
 
-    // Update real-time metrics. Before the Binance socket connects the price is
+    // Update real-time metrics. Before any price source connects the price is
     // 0 — never overwrite the last known price with 0.
-    const livePrice = btcPriceService.getPrice();
+    const livePrice = bestBtcPrice();
     const currentPrice =
       livePrice > 0 ? livePrice : this.currentRound.currentPrice;
     const secondsRemaining = Math.max(0, Math.floor((this.currentRound.endsAt - now) / 1000));
@@ -124,7 +137,7 @@ class RoundWatcher {
     try {
       const active = await predictFunApi.getActiveBtc5mRound();
       const now = Date.now();
-      const currentBtcPrice = btcPriceService.getPrice();
+      const currentBtcPrice = bestBtcPrice();
 
       if (active) {
         const { round, market } = active;
@@ -212,6 +225,7 @@ class RoundWatcher {
         upPrice: 0.5,
         downPrice: 0.5,
         isLocked: secondsRemaining <= config.trading.lockGuardSeconds,
+        synthetic: true,
       };
       logger.warn('No active series round — using synthetic placeholder (orders disabled)');
       this.consecutiveRefreshFailures = 0;

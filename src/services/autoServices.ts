@@ -23,7 +23,13 @@ const notifyTargets: Map<number, NotifyTarget> = new Map();
 const redeemedKeys: Set<string> = new Set();
 /** Failures already reported, to avoid spamming the chat every minute. */
 const reportedFailures: Set<string> = new Set();
+/** Redeem keys that failed too many times — stopped from retrying forever. */
+const deadRedeems: Set<string> = new Set();
+/** Failure counts per redeem key (for the give-up threshold). */
+const redeemAttempts: Map<string, number> = new Map();
 let redeemInFlight = false;
+/** Give up on a redeem key after this many failed attempts in one run. */
+const MAX_REDEEM_ATTEMPTS = 5;
 
 function persistAuto() {
   stateStore.update((s) => {
@@ -110,6 +116,14 @@ async function broadcast(bot: Bot<Context>, text: string, parseMode: 'HTML' | un
   }
 }
 
+/** Map a raw outcome name ("Up"/"Yes"/"Down"/"No") to our UP/DOWN sides. */
+function sideOf(name: string): 'UP' | 'DOWN' | null {
+  const n = (name || '').toLowerCase();
+  if (n.includes('up') || n.includes('yes')) return 'UP';
+  if (n.includes('down') || n.includes('no')) return 'DOWN';
+  return null;
+}
+
 /** PnL for a resolved position; negative for lost bets. */
 function positionPnl(pos: PredictPosition): number | null {
   const apiPnl =
@@ -135,8 +149,10 @@ export function startAutoServices(bot: Bot<Context>) {
     for (const target of notifyTargets.values()) {
       if (target.paused) continue;
 
-      // New round started — notify once per market id
-      if (target.lastNotifiedRoundId !== roundId) {
+      // New round started — notify once per market id. Synthetic placeholder
+      // rounds (API outage) are silent: there is nothing to bet on and it
+      // would just spam every slot.
+      if (!round.synthetic && target.lastNotifiedRoundId !== roundId) {
         target.lastNotifiedRoundId = roundId;
         target.lastLockWarnedRoundId = '';
         try {
@@ -162,6 +178,7 @@ export function startAutoServices(bot: Bot<Context>) {
 
       // Lock warning once when we enter the guard window
       if (
+        !round.synthetic &&
         round.secondsRemaining <= config.trading.lockGuardSeconds &&
         round.secondsRemaining > 0 &&
         target.lastLockWarnedRoundId !== roundId
@@ -181,11 +198,106 @@ export function startAutoServices(bot: Bot<Context>) {
   });
 
   // ─── Settle + auto-redeem resolved positions ─────────────────────
-  if (config.trading.autoRedeem) {
+  if (config.trading.dryRun) {
+    // DRY RUN: simulate settlement from the resolved market's start/end price.
+    // Without this, dry-run trades stay "Pending" forever and PnL / the loss
+    // circuit breaker can never be tested.
     setInterval(async () => {
-      if (redeemInFlight || config.trading.dryRun) return;
+      if (redeemInFlight) return;
       redeemInFlight = true;
       try {
+        const open = riskManager.getUnsettledDryRunTrades();
+        if (open.length === 0) return;
+
+        const byMarket = new Map<string, typeof open>();
+        for (const t of open) {
+          const list = byMarket.get(t.marketId) || [];
+          list.push(t);
+          byMarket.set(t.marketId, list);
+        }
+
+        for (const [marketId, trades] of byMarket) {
+          let market;
+          try {
+            market = await predictFunApi.getMarket(marketId);
+          } catch (e) {
+            logger.warn({ err: e, marketId }, 'Dry-run settle: market fetch failed');
+            continue;
+          }
+          if (!market) continue;
+
+          const start = market.variantData?.startPrice;
+          const end = market.variantData?.endPrice;
+          const resolved =
+            (market.tradingStatus || market.status) === 'RESOLVED' ||
+            (typeof start === 'number' && start > 0 && typeof end === 'number' && end > 0);
+          if (!resolved) continue;
+
+          // Winner from start/end price; fall back to a WIN-flagged outcome.
+          let winner: 'UP' | 'DOWN' | 'TIE' | null = null;
+          if (typeof start === 'number' && start > 0 && typeof end === 'number' && end > 0) {
+            winner = end > start ? 'UP' : end < start ? 'DOWN' : 'TIE';
+          } else {
+            const winOutcome = (market.outcomes || []).find(
+              (o) => typeof o.status === 'string' && o.status.toUpperCase().includes('WIN')
+            );
+            if (winOutcome) winner = sideOf(winOutcome.name);
+          }
+          if (winner === null) {
+            logger.warn({ marketId }, 'Dry-run settle: winner could not be determined');
+            continue;
+          }
+
+          for (const trade of trades) {
+            const result = winner === 'TIE' ? 'REFUND' : winner === trade.outcome ? 'WON' : 'LOST';
+            if (riskManager.settleDryRun(trade, result)) {
+              const pnl = trade.pnlUsd ?? 0;
+              logger.info(
+                { marketId, outcome: trade.outcome, result, pnl },
+                '[DRY RUN] Trade settled'
+              );
+              await broadcast(
+                bot,
+                [
+                  `🧪 <b>[DRY RUN] Settled</b>`,
+                  `Market: ${esc(market.title || market.question || marketId)}`,
+                  `Bet: ${trade.outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} $${trade.amountUsdt.toFixed(2)} @ ${(trade.price * 100).toFixed(0)}¢`,
+                  `Result: ${result === 'WON' ? '✅ WON' : result === 'LOST' ? '❌ LOST' : '↩️ REFUND'}`,
+                  `PnL: <b>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</b>`,
+                  `Today's loss: $${riskManager.getStats().dailyLoss} / $${config.trading.dailyLossLimitUsdt}`,
+                ].join('\n')
+              );
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn({ err: e }, 'Dry-run settle cycle failed');
+      } finally {
+        redeemInFlight = false;
+      }
+    }, 30000); // Check every 30 seconds
+  } else {
+    // LIVE: settle outcomes (win OR loss — the circuit breaker needs losses!)
+    // every cycle; redeeming winners is optional behind AUTO_REDEEM.
+    setInterval(async () => {
+      if (redeemInFlight) return;
+      redeemInFlight = true;
+      try {
+        // 0) Orders placed earlier may have filled since — mark them filled so
+        //    exposure/stats reflect reality.
+        if (riskManager.hasUnfilledTrades()) {
+          try {
+            const all = await predictFunApi.getPositions();
+            for (const pos of all) {
+              if (pos.isResolved) continue;
+              const side = sideOf(pos.outcome);
+              if (side) riskManager.markFilled(pos.marketId, side);
+            }
+          } catch (e) {
+            logger.warn({ err: e }, 'Fill reconciliation pass failed');
+          }
+        }
+
         const positions = await predictFunApi.getPositions({ isResolved: true });
 
         // 1) Settle every resolved position (win OR loss) exactly once.
@@ -202,68 +314,81 @@ export function startAutoServices(bot: Bot<Context>) {
         }
 
         // 2) Redeem only winning positions, once each, isolating failures.
-        for (const pos of positions) {
-          if (!pos.conditionId || !pos.isSettled) continue;
+        if (config.trading.autoRedeem) {
+          for (const pos of positions) {
+            if (!pos.conditionId || !pos.isSettled) continue;
 
-          const redeemKey = `${pos.conditionId}|${pos.indexSet ?? '1'}`;
-          if (redeemedKeys.has(redeemKey)) continue;
+            const redeemKey = `${pos.conditionId}|${pos.indexSet ?? '1'}`;
+            if (redeemedKeys.has(redeemKey) || deadRedeems.has(redeemKey)) continue;
 
-          const indexSet = pos.indexSet === '2' ? 2 : 1;
-          const amountWei = pos.isNegRisk
-            ? ethers.parseUnits(pos.shares.toFixed(6), 18)
-            : undefined;
+            const indexSet = pos.indexSet === '2' ? 2 : 1;
+            const amountWei = pos.isNegRisk
+              ? ethers.parseUnits(pos.shares.toFixed(6), 18)
+              : undefined;
 
-          try {
-            logger.info(
-              { conditionId: pos.conditionId, marketId: pos.marketId, isNegRisk: pos.isNegRisk },
-              'Auto-redeeming settled position...'
-            );
+            try {
+              logger.info(
+                { conditionId: pos.conditionId, marketId: pos.marketId, isNegRisk: pos.isNegRisk },
+                'Auto-redeeming settled position...'
+              );
 
-            const result = await predictSigner.redeemCondition(
-              pos.conditionId,
-              indexSet as 1 | 2,
-              !!pos.isNegRisk,
-              pos.isYieldBearing ?? false,
-              amountWei
-            );
+              const result = await predictSigner.redeemCondition(
+                pos.conditionId,
+                indexSet as 1 | 2,
+                !!pos.isNegRisk,
+                pos.isYieldBearing ?? false,
+                amountWei
+              );
 
-            if (!result.success) {
-              const failKey = `redeem|${redeemKey}`;
-              if (!reportedFailures.has(failKey)) {
-                reportedFailures.add(failKey);
-                logger.warn(
-                  { conditionId: pos.conditionId, error: result.error },
-                  'Auto-redeem failed'
-                );
-                await broadcast(
-                  bot,
-                  [
-                    `⚠️ <b>Auto-redeem failed</b>`,
-                    `Market: ${esc(pos.marketTitle || pos.marketId)}`,
-                    `Reason: ${esc(result.error || 'unknown')}`,
-                  ].join('\n')
-                );
+              if (!result.success) {
+                const failKey = `redeem|${redeemKey}`;
+                const tries = (redeemAttempts.get(redeemKey) || 0) + 1;
+                redeemAttempts.set(redeemKey, tries);
+                if (tries >= MAX_REDEEM_ATTEMPTS) {
+                  // Stop burning calls/gas-estimates on a permanently failing
+                  // redeem (e.g. already redeemed externally, no gas).
+                  deadRedeems.add(redeemKey);
+                  logger.warn(
+                    { conditionId: pos.conditionId, tries },
+                    'Auto-redeem gave up after repeated failures'
+                  );
+                }
+                if (!reportedFailures.has(failKey)) {
+                  reportedFailures.add(failKey);
+                  logger.warn(
+                    { conditionId: pos.conditionId, error: result.error },
+                    'Auto-redeem failed'
+                  );
+                  await broadcast(
+                    bot,
+                    [
+                      `⚠️ <b>Auto-redeem failed</b>`,
+                      `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+                      `Reason: ${esc(result.error || 'unknown')}`,
+                    ].join('\n')
+                  );
+                }
+                continue;
               }
-              continue;
-            }
 
-            redeemedKeys.add(redeemKey);
-            persistAuto();
-            await broadcast(
-              bot,
-              [
-                `✅ <b>Position Redeemed!</b>`,
-                `Market: ${esc(pos.marketTitle || pos.marketId)}`,
-                `Outcome: ${esc(pos.outcome)}`,
-                `TX: <code>${result.txHash || 'N/A'}</code>`,
-              ].join('\n')
-            );
-          } catch (e: any) {
-            // One bad position must not stall the rest of the cycle.
-            logger.warn(
-              { err: e, conditionId: pos.conditionId },
-              'Auto-redeem cycle item failed'
-            );
+              redeemedKeys.add(redeemKey);
+              persistAuto();
+              await broadcast(
+                bot,
+                [
+                  `✅ <b>Position Redeemed!</b>`,
+                  `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+                  `Outcome: ${esc(pos.outcome)}`,
+                  `TX: <code>${result.txHash || 'N/A'}</code>`,
+                ].join('\n')
+              );
+            } catch (e: any) {
+              // One bad position must not stall the rest of the cycle.
+              logger.warn(
+                { err: e, conditionId: pos.conditionId },
+                'Auto-redeem cycle item failed'
+              );
+            }
           }
         }
       } catch (e) {

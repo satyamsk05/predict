@@ -11,7 +11,20 @@ export interface TradeRecord {
   orderId?: string;
   pnlUsd?: number;
   settled: boolean;
+  /**
+   * A placed limit order may never fill. Exposure/stats only count trades we
+   * know are filled (or that were simulated in dry-run). Old records without
+   * the flag are treated as filled for backward compatibility.
+   */
+  filled?: boolean;
+  /** Set by the dry-run simulator so live settlements never touch them. */
+  dryRun?: boolean;
 }
+
+/** Max trades kept in memory + on disk (matches store.ts MAX_TRADES). */
+const TRADE_HISTORY_MAX = 200;
+
+export type DryRunResult = 'WON' | 'LOST' | 'REFUND';
 
 class RiskManager {
   private dailyLossUsd: number = 0;
@@ -55,7 +68,7 @@ class RiskManager {
         lastResetDay: this.lastResetDay,
         isTripped: this.isTripped,
         tripReason: this.tripReason,
-        trades: this.tradeHistory.slice(-200),
+        trades: this.tradeHistory.slice(-TRADE_HISTORY_MAX),
         settledKeys: [...this.settledKeys].slice(-1000),
       };
     });
@@ -126,9 +139,20 @@ class RiskManager {
   public recordTrade(trade: TradeRecord) {
     this.dailyTradesCount++;
     this.consecutiveErrors = 0;
+    // Defaults so callers don't have to remember the flags.
+    trade.filled ??= true;
+    trade.dryRun ??= config.trading.dryRun;
     this.tradeHistory.push(trade);
-    if (this.tradeHistory.length > 100) {
-      this.tradeHistory.shift();
+    if (this.tradeHistory.length > TRADE_HISTORY_MAX) {
+      // Prefer dropping settled history; only drop open trades as a last resort.
+      while (this.tradeHistory.length > TRADE_HISTORY_MAX) {
+        const idx = this.tradeHistory.findIndex((t) => t.settled);
+        if (idx === -1) {
+          this.tradeHistory.shift();
+          break;
+        }
+        this.tradeHistory.splice(idx, 1);
+      }
     }
     this.persist();
   }
@@ -145,7 +169,11 @@ class RiskManager {
    * redeemed (winning) positions were settled, so `dailyLossUsd` never moved and
    * the loss circuit breaker could never trip.
    *
-   * @returns true when a matching open trade was found and settled.
+   * Multiple trades can map to one API position (e.g. two bets on the same
+   * side in the same round). The aggregate PnL is now split across ALL matching
+   * unsettled trades pro-rata by stake, so no trade is left "Pending" forever.
+   *
+   * @returns true when at least one matching open trade was settled.
    */
   public recordSettlement(marketId: string, pnlUsd: number, outcome?: string): boolean {
     if (!Number.isFinite(pnlUsd)) return false;
@@ -153,19 +181,72 @@ class RiskManager {
     const key = `${marketId}|${outcome || ''}`;
     if (this.settledKeys.has(key)) return false;
 
-    const trade =
-      this.tradeHistory.find(
-        (t) => t.marketId === marketId && !t.settled && (!outcome || t.outcome === outcome)
-      ) || this.tradeHistory.find((t) => t.marketId === marketId && !t.settled);
-
-    if (!trade) return false;
+    let matches = this.tradeHistory.filter(
+      (t) => t.marketId === marketId && !t.settled && (!outcome || t.outcome === outcome)
+    );
+    if (matches.length === 0) {
+      matches = this.tradeHistory.filter((t) => t.marketId === marketId && !t.settled);
+    }
+    if (matches.length === 0) return false;
 
     this.settledKeys.add(key);
-    trade.settled = true;
-    trade.pnlUsd = pnlUsd;
 
-    if (pnlUsd < 0) {
-      this.dailyLossUsd += Math.abs(pnlUsd);
+    const totalAmount = matches.reduce((sum, t) => sum + t.amountUsdt, 0);
+    for (const trade of matches) {
+      trade.settled = true;
+      trade.filled = true; // a resolved position must have filled
+      const share = totalAmount > 0 ? trade.amountUsdt / totalAmount : 1 / matches.length;
+      trade.pnlUsd = pnlUsd * share;
+      if (trade.pnlUsd < 0) {
+        this.dailyLossUsd += Math.abs(trade.pnlUsd);
+      }
+    }
+
+    if (this.dailyLossUsd >= config.trading.dailyLossLimitUsdt) {
+      this.trip(`Daily loss limit reached ($${this.dailyLossUsd.toFixed(2)} loss today)`);
+    }
+
+    this.persist();
+    return true;
+  }
+
+  /**
+   * A live order that was placed but never confirmed filled. Called once an
+   * open position for market+outcome appears in the API.
+   * @returns how many trades were marked filled.
+   */
+  public markFilled(marketId: string, outcome: 'UP' | 'DOWN'): number {
+    let marked = 0;
+    for (const t of this.tradeHistory) {
+      if (t.marketId === marketId && t.outcome === outcome && !t.settled && t.filled === false) {
+        t.filled = true;
+        marked++;
+      }
+    }
+    if (marked > 0) this.persist();
+    return marked;
+  }
+
+  /**
+   * Dry-run settlement from the resolved market's start/end price — no API
+   * pnl needed. PnL is derived from the trade's own entry price:
+   *   WON    → shares × $1 − stake
+   *   LOST   → −stake
+   *   REFUND → 0 (round ended exactly at the lock price)
+   */
+  public settleDryRun(trade: TradeRecord, result: DryRunResult): boolean {
+    if (trade.settled || !(trade.price > 0)) return false;
+    trade.settled = true;
+    trade.filled = true;
+    trade.pnlUsd =
+      result === 'WON'
+        ? trade.amountUsdt / trade.price - trade.amountUsdt
+        : result === 'LOST'
+        ? -trade.amountUsdt
+        : 0;
+
+    if (trade.pnlUsd < 0) {
+      this.dailyLossUsd += Math.abs(trade.pnlUsd);
       if (this.dailyLossUsd >= config.trading.dailyLossLimitUsdt) {
         this.trip(`Daily loss limit reached ($${this.dailyLossUsd.toFixed(2)} loss today)`);
       }
@@ -173,6 +254,16 @@ class RiskManager {
 
     this.persist();
     return true;
+  }
+
+  /** Unsettled trades placed in dry-run mode (input for the dry-run settler). */
+  public getUnsettledDryRunTrades(): TradeRecord[] {
+    return this.tradeHistory.filter((t) => !t.settled && t.dryRun === true);
+  }
+
+  /** True when a live order was placed but not yet confirmed filled. */
+  public hasUnfilledTrades(): boolean {
+    return this.tradeHistory.some((t) => !t.settled && t.filled === false);
   }
 
   public getOpenTrades(): TradeRecord[] {
@@ -202,10 +293,11 @@ class RiskManager {
     return [...this.tradeHistory].reverse().slice(0, 10);
   }
 
-  /** Total USDT currently staked in unresolved trades (informational). */
+  /** Total USDT currently staked in unresolved FILLED trades (informational).
+   *  Unfilled limit orders commit no funds, so they are excluded. */
   public getOpenExposureUsdt(): number {
     return this.tradeHistory
-      .filter((t) => !t.settled)
+      .filter((t) => !t.settled && t.filled !== false)
       .reduce((sum, t) => sum + t.amountUsdt, 0);
   }
 }

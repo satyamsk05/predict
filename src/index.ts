@@ -103,6 +103,17 @@ async function main() {
   process.once('SIGINT', () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
 
+  // A crash must never lose the last persisted trade / circuit-breaker state.
+  process.on('unhandledRejection', (reason) => {
+    logger.error({ err: reason }, 'Unhandled promise rejection (state flushed, bot keeps running)');
+    stateStore.saveNow();
+  });
+  process.on('uncaughtException', (err) => {
+    logger.error({ err }, 'Uncaught exception — flushing state and exiting');
+    stateStore.saveNow();
+    process.exit(1);
+  });
+
   // Start polling
   logger.info('Bot is now polling for messages...');
   await bot.start({

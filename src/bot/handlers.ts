@@ -25,6 +25,7 @@ import {
   setNotifyPaused,
   isNotifyPaused,
 } from '../services/autoServices.js';
+import { parseBetText } from './betText.js';
 
 type BetDraft = {
   outcome?: 'UP' | 'DOWN';
@@ -64,18 +65,8 @@ function outcomeToSide(name: string): 'UP' | 'DOWN' | null {
   return null;
 }
 
-/** Best bid = price someone will pay right now if we sell. */
-async function bestBidFor(position: PredictPosition): Promise<number | null> {
-  const market = await predictFunApi.getMarket(position.marketId);
-  if (!market) return null;
-  const outcome =
-    market.outcomes.find(
-      (o) => String(o.onChainId || o.tokenId || '') === position.tokenId
-    ) ||
-    market.outcomes.find((o) => outcomeToSide(o.name) === outcomeToSide(position.outcome));
-  const bid = outcome?.bestBid?.price;
-  if (typeof bid === 'number' && bid > 0 && bid < 1) return bid;
-  return null;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 type PositionPnl = {
@@ -159,7 +150,7 @@ export async function handleStart(ctx: Context) {
 
   try {
     const bal = await predictFunApi.getBalance();
-    balance = bal.usdt;
+    balance = bal.ok ? bal.usdt : undefined;
   } catch {
     balance = undefined;
   }
@@ -214,31 +205,7 @@ export async function handleHelp(ctx: Context) {
 // ───────────────────────────────────────────────
 // /up and /down quick commands
 // ───────────────────────────────────────────────
-/**
- * Parse "up 1 50" (= $1 UP at 50¢) style text.
- * Third value: `< 1` is treated as dollars, otherwise cents.
- */
-export function parseBetText(
-  text: string
-): { outcome: 'UP' | 'DOWN'; amountUsdt: number; limitPrice?: number } | null {
-  const m = text
-    .trim()
-    .match(/^(up|down)\s+\$?(\d+(?:\.\d+)?)(?:\s*@?\s*(\d+(?:\.\d+)?))?$/i);
-  if (!m) return null;
-
-  const outcome = m[1].toUpperCase() as 'UP' | 'DOWN';
-  const amountUsdt = parseFloat(m[2]);
-  if (!(amountUsdt > 0)) return null;
-
-  let limitPrice: number | undefined;
-  if (m[3] != null) {
-    const raw = parseFloat(m[3]);
-    limitPrice = raw < 1 ? raw : raw / 100;
-    if (!(limitPrice >= 0.01 && limitPrice <= 0.99)) return null;
-  }
-
-  return { outcome, amountUsdt, limitPrice };
-}
+// parseBetText lives in betText.ts (pure, unit-tested) — imported at the top.
 
 async function quickBet(
   ctx: Context,
@@ -363,7 +330,7 @@ async function showConfirm(
       ? belowMarket
         ? `⏳ Below market (${(marketPrice * 100).toFixed(0)}¢) — order book mein lagega, fill hone par position banegi.`
         : `✅ Limit price market ke barabar/upar — turant fill hone chahiye.`
-      : '',
+      : `ℹ️ Marketable order — price move hone par slippage cap (${(config.trading.slippageBps / 100).toFixed(1)}%) tak pay ho sakta hai.`,
     config.trading.dryRun ? `\n🧪 <b>DRY RUN — No real order</b>` : '',
   ]
     .join('\n')
@@ -586,11 +553,19 @@ async function placeOrder(
   ctx: Context,
   outcome: 'UP' | 'DOWN',
   amountUsdt: number,
-  limitPrice?: number
+  limitPrice?: number,
+  expectedMarketId?: string
 ) {
   const round = roundWatcher.getCurrentRound();
   if (!round) {
     return ctx.reply('❌ Round expired. Please start a new bet.', { reply_markup: mainKb(ctx) });
+  }
+  // Guard against the round rolling over between the confirm card and this
+  // call: never execute a bet pinned to round X on round X+1.
+  if (expectedMarketId && round.marketId !== expectedMarketId) {
+    return ctx.reply('⛔ Round changed since you confirmed — bet cancelled for safety.', {
+      reply_markup: mainKb(ctx),
+    });
   }
   if (round.isLocked) {
     return ctx.reply('⛔ Round locked! Too late to bet.', { reply_markup: mainKb(ctx) });
@@ -644,22 +619,28 @@ async function placeOrder(
   // for approvals/settlement.
   try {
     const bal = await predictFunApi.getBalance();
-    // A limit order spends exactly `amountUsdt`; a marketable order may pay
-    // up to the slippage cap.
-    const needed = limitPrice != null
-      ? amountUsdt
-      : amountUsdt * (1 + config.trading.slippageBps / 10000);
-    if (bal.usdt + 1e-9 < needed) {
-      return ctx.reply(
-        `🚫 <b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
-        { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
-      );
-    }
-    if (bal.bnb < 0.0005) {
-      return ctx.reply(
-        `⚠️ <b>Low BNB for gas</b>\nBalance: ${bal.bnb.toFixed(6)} BNB. Top up before trading.`,
-        { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
-      );
+    // A failed balance fetch is not the same as an empty wallet — skip the
+    // pre-flight rather than blocking/allowing on bogus data.
+    if (bal.ok) {
+      // A limit order spends exactly `amountUsdt`; a marketable order may pay
+      // up to the slippage cap.
+      const needed = limitPrice != null
+        ? amountUsdt
+        : amountUsdt * (1 + config.trading.slippageBps / 10000);
+      if (bal.usdt + 1e-9 < needed) {
+        return ctx.reply(
+          `🚫 <b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
+          { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+        );
+      }
+      if (bal.bnb < 0.0005) {
+        return ctx.reply(
+          `⚠️ <b>Low BNB for gas</b>\nBalance: ${bal.bnb.toFixed(6)} BNB. Top up before trading.`,
+          { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+        );
+      }
+    } else {
+      logger.warn('Balance unavailable (RPC error) — skipping pre-flight check');
     }
   } catch (e: any) {
     logger.warn({ err: e }, 'Could not verify balance before order — continuing');
@@ -675,6 +656,8 @@ async function placeOrder(
     const result = await predictSigner.placeBet(round.rawMarket, outcome, amountUsdt, price);
 
     if (result.success) {
+      // A placed limit order is NOT a filled position — record it unfilled and
+      // reconcile once the position appears on-chain (see confirmFill...).
       riskManager.recordTrade({
         timestamp: Date.now(),
         marketId: round.marketId,
@@ -683,6 +666,7 @@ async function placeOrder(
         price,
         orderId: result.orderId || result.orderHash,
         settled: false,
+        filled: false,
       });
 
       logger.info({ marketId: round.marketId, outcome, amountUsdt, orderId: result.orderId }, 'Order placed!');
@@ -697,9 +681,14 @@ async function placeOrder(
           `Outcome: ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
           `Amount: $${amountUsdt.toFixed(2)} USDT`,
           `Order ID: <code>${result.orderId || result.orderHash || 'N/A'}</code>`,
+          ``,
+          `⏳ Fill confirm ho raha hai…`,
         ].join('\n'),
         { parse_mode: 'HTML' }
       );
+
+      // Fire-and-forget fill confirmation (5s × 3 attempts).
+      void confirmFillAndNotify(ctx, ctx.chat!.id, round.marketId, outcome);
     } else {
       riskManager.recordFailure(result.error || 'Unknown error');
       await ctx.api.editMessageText(
@@ -720,6 +709,52 @@ async function placeOrder(
   }
 }
 
+/**
+ * After a live BUY order is placed, poll the position list a few times to
+ * confirm the order actually filled. Notifies the chat either way, and marks
+ * the trade filled in the risk manager so exposure stays honest.
+ */
+async function confirmFillAndNotify(
+  ctx: Context,
+  chatId: number,
+  marketId: string,
+  outcome: 'UP' | 'DOWN'
+) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(5000);
+    try {
+      const positions = await predictFunApi.getPositions();
+      const filled = positions.some(
+        (p) =>
+          p.marketId === marketId &&
+          !p.isResolved &&
+          outcomeToSide(p.outcome) === outcome
+      );
+      if (filled) {
+        if (riskManager.markFilled(marketId, outcome) > 0) {
+          await ctx.api
+            .sendMessage(
+              chatId,
+              `✅ <b>Order filled</b> — ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} position live. 📦 Open mein dikhega.`,
+              { parse_mode: 'HTML' }
+            )
+            .catch(() => {});
+        }
+        return;
+      }
+    } catch {
+      // positions fetch failed — retry on the next attempt
+    }
+  }
+  await ctx.api
+    .sendMessage(
+      chatId,
+      `ℹ️ <b>Order abhi tak fill nahi hua</b> — limit order book mein lag sakta hai.\n📦 Open mein aadhe minute baad check karo. Unfilled order se koi funds lock nahi hote jab tak fill na ho.`,
+      { parse_mode: 'HTML' }
+    )
+    .catch(() => {});
+}
+
 // ───────────────────────────────────────────────
 // /balance
 // ───────────────────────────────────────────────
@@ -727,7 +762,12 @@ export async function handleBalance(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
 
   try {
-    const { usdt, bnb } = await predictFunApi.getBalance();
+    const { usdt, bnb, ok } = await predictFunApi.getBalance();
+    if (!ok) {
+      return ctx.reply('❌ Balance fetch nahi ho paya (RPC error). Thodi der baad try karo.', {
+        reply_markup: mainKb(ctx),
+      });
+    }
     const address = predictFunApi.getEffectiveAddress();
     await ctx.reply(
       [
@@ -1038,7 +1078,7 @@ export async function handleTextMessage(ctx: Context) {
         reply_markup: mainKb(ctx),
       });
     }
-    return placeOrder(ctx, outcome, amountUsdt, limitPrice);
+    return placeOrder(ctx, outcome, amountUsdt, limitPrice, marketId);
   }
   if (text === BTN.CANCEL && draft) {
     clearDraft(userId);

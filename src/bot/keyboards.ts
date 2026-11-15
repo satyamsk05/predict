@@ -1,4 +1,5 @@
 import { InlineKeyboard, Keyboard } from 'grammy';
+import { config } from '../config/index.js';
 import type { ActiveRoundState } from '../services/roundWatcher.js';
 
 /** Persistent main menu — ReplyKeyboard (keyword buttons) */
@@ -76,8 +77,8 @@ export function buildRoundCard(round: ActiveRoundState, balance?: number): strin
   const lockWarning = round.isLocked
     ? '\n⛔ <b>BETTING LOCKED</b> — Round closing!'
     : '';
-  const dryRun =
-    process.env.DRY_RUN !== 'false' ? '\n🧪 <b>DRY RUN MODE</b> — No real orders' : '';
+  // Use the parsed config (strict) — raw env comparison casing is inconsistent.
+  const dryRun = config.trading.dryRun ? '\n🧪 <b>DRY RUN MODE</b> — No real orders' : '';
   const balanceLine =
     balance !== undefined ? `\n💼 <b>Balance:</b> $${esc(formatPrice(balance))} USDT` : '';
 
