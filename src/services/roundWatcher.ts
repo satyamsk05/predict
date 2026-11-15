@@ -1,7 +1,7 @@
 import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { btcPriceService } from './btcPrice.js';
-import { pythPriceService } from './pythPrice.js';
+import { chainlinkPriceService } from './chainlinkPrice.js';
 import { predictFunApi } from '../exchanges/predictfun/api.js';
 import { outcomeBuyPrice, type PredictMarket } from '../exchanges/predictfun/types.js';
 
@@ -28,11 +28,11 @@ export interface ActiveRoundState {
 
 /**
  * Best available BTC price, in settlement-parity order:
- * 1. Pyth (the oracle Predict.fun actually settles against)
- * 2. Binance spot (fallback while Pyth is cold/unreachable)
+ * 1. Chainlink BTC/USD on-chain feed (what Predict.fun settles against)
+ * 2. Binance spot (fallback while Chainlink is cold/unreachable)
  */
 function bestBtcPrice(): number {
-  return pythPriceService.getPrice() || btcPriceService.getPrice();
+  return chainlinkPriceService.getPrice() || btcPriceService.getPrice();
 }
 
 function findOutcome(market: PredictMarket, side: 'UP' | 'DOWN') {
@@ -54,7 +54,7 @@ class RoundWatcher {
   private consecutiveRefreshFailures = 0;
 
   constructor() {
-    pythPriceService.start();
+    chainlinkPriceService.start();
     this.refreshRound();
     this.checkInterval = setInterval(() => this.tick(), 1000);
   }
