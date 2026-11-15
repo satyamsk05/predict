@@ -1,0 +1,11 @@
+Fix Pyth oracle auth: price endpoints now require an API key (HTTP 401)
+
+- Hermes /v2/updates/price/latest returns 401 without auth (Pyth changed
+  access model); on-chain Pyth Core prices on BNB are push-on-demand and
+  revert when stale, so direct contract reads are not viable for polling
+- pythPrice now stays dormant without PYTH_API_KEY (no 401 log spam) and
+  uses Binance spot as the price source — unchanged trading behavior
+- With a free key (dashboard.pyth.network) it polls the documented
+  pyth.dourolabs.app/hermes endpoint with a Bearer token for settlement parity
+- scripts/test-pyth-onchain.js: diagnostic for Pyth contract reads
+- .env.example: PYTH_API_KEY / PYTH_HERMES_URL docs

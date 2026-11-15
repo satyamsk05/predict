@@ -1,22 +1,29 @@
 import { logger } from '../utils/logger.js';
 
 /**
- * Pyth Hermes price feed.
+ * Pyth oracle price — settlement parity with Predict.fun rounds.
  *
  * Predict.fun settles BTC rounds against a Pyth price feed (see
- * `market.variantData.priceFeedId`), NOT against Binance spot. Using the same
- * oracle for the bot's trend/lock comparison keeps the displayed "UP/DOWN"
- * state in sync with what the market will actually settle on.
+ * `market.variantData.priceFeedId`), NOT against Binance spot.
  *
- * Default feed id: Pyth BTC/USD (the standard one across all Pyth chains).
- * Override with PYTH_FEED_ID if Predict.fun uses a different feed.
+ * IMPORTANT (late 2026): Pyth's Hermes price-update endpoints now require an
+ * API key (HTTP 401 without one). Get a free key and set PYTH_API_KEY —
+ * the bot then polls the documented endpoint with a Bearer token. Without a
+ * key the service stays dormant and the bot uses the Binance fallback.
+ *
+ *   1. https://dashboard.pyth.network  → get a free API key
+ *   2. .env: PYTH_API_KEY=your_key
+ *
+ * Feed override: PYTH_FEED_ID (default is the standard Pyth BTC/USD feed).
  */
 const DEFAULT_BTC_USD_FEED =
   '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43';
 
-const HERMES_URL =
-  process.env.PYTH_HERMES_URL || 'https://hermes.pyth.network';
+/** Documented Hermes-compatible endpoint for API-key access. */
+const DEFAULT_HERMES_URL = 'https://pyth.dourolabs.app/hermes';
 const FEED_ID = (process.env.PYTH_FEED_ID || DEFAULT_BTC_USD_FEED).replace(/^0x/, '');
+const HERMES_URL = (process.env.PYTH_HERMES_URL || DEFAULT_HERMES_URL).replace(/\/$/, '');
+const API_KEY = (process.env.PYTH_API_KEY || '').trim();
 
 /** A price older than this is considered stale and reported as unavailable. */
 const STALE_AFTER_MS = 15_000;
@@ -30,14 +37,17 @@ class PythPriceService {
 
   public start() {
     if (this.started) return;
+    if (!API_KEY) {
+      logger.info('PYTH_API_KEY not set — Pyth oracle disabled, using Binance price (set a free key from dashboard.pyth.network for settlement parity)');
+      return;
+    }
     this.started = true;
     void this.poll();
   }
 
   private async poll() {
     await this.fetchOnce();
-    // 2s normally, back off to 10s when Hermes is unreachable so we don't
-    // hammer a failing endpoint.
+    // 2s normally, back off to 10s when the endpoint misbehaves.
     const interval = this.consecutiveFailures > 3 ? 10_000 : 2_000;
     this.timer = setTimeout(() => void this.poll(), interval);
   }
@@ -46,7 +56,10 @@ class PythPriceService {
     try {
       const res = await fetch(
         `${HERMES_URL}/v2/updates/price/latest?ids[]=0x${FEED_ID}`,
-        { signal: AbortSignal.timeout(5_000) }
+        {
+          headers: { Authorization: `Bearer ${API_KEY}` },
+          signal: AbortSignal.timeout(5_000),
+        }
       );
       if (!res.ok) throw new Error(`Hermes HTTP ${res.status}`);
 
@@ -68,7 +81,8 @@ class PythPriceService {
       this.consecutiveFailures = 0;
     } catch (e: any) {
       this.consecutiveFailures++;
-      if (this.consecutiveFailures <= 3 || this.consecutiveFailures % 30 === 0) {
+      // Log the first few, then every 30th — no spam.
+      if (this.consecutiveFailures <= 2 || this.consecutiveFailures % 30 === 0) {
         logger.warn(
           { err: e?.message, failures: this.consecutiveFailures },
           'Pyth price fetch failed (Binance fallback stays active)'
