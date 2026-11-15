@@ -1,4 +1,5 @@
 import type { Context } from 'grammy';
+import { InlineKeyboard } from 'grammy';
 import crypto from 'node:crypto';
 import { config, walletInfo } from '../config/index.js';
 import { logger } from '../utils/logger.js';
@@ -363,6 +364,9 @@ export async function handleCallbackQuery(ctx: Context) {
   }
 
   try {
+    // Export card buttons (x:y:<userId> / x:n:<userId>)
+    if (await handleExportCallback(ctx, data)) return;
+
     if (data === 'p:l') {
       await ctx.answerCallbackQuery();
       try {
@@ -915,10 +919,60 @@ export async function handleHistory(ctx: Context) {
 }
 
 // ───────────────────────────────────────────────
-// /export — private key via Telegram (2-step confirm, whitelist required)
+// /export — private key via Telegram
+// (inline Yes/Cancel confirm, key message auto-deletes after 90s)
 // ───────────────────────────────────────────────
-/** Per-user pending export confirmation codes (5 min expiry). */
+/** Per-user pending export confirmation codes (5 min expiry) — legacy text flow. */
 const pendingExports: Map<number, { code: string; expires: number }> = new Map();
+
+/** How long the private-key message lives in the chat before auto-delete. */
+const EXPORT_KEY_DELETE_MS = 90_000;
+
+/** Delete the key message after 90s (best-effort: old messages may refuse). */
+function scheduleKeyAutoDelete(api: Context['api'], chatId: number, messageId: number) {
+  setTimeout(() => {
+    void api
+      .deleteMessage(chatId, messageId)
+      .then(() => logger.info({ chatId }, 'Exported key message auto-deleted'))
+      .catch(() => {
+        // Too old / already deleted — nothing we can do; the warning told the user.
+      });
+  }, EXPORT_KEY_DELETE_MS);
+}
+
+function buildExportCard() {
+  return [
+    '🔐 <b>Export Private Key</b>',
+    ``,
+    `Wallet: <code>${esc(walletInfo.address)}</code>`,
+    `Source: ${walletInfo.source === 'env' ? '.env' : esc(walletInfo.file)}`,
+    ``,
+    `⚠️ <b>WARNING:</b> Your private key gives FULL access to this wallet and its funds.`,
+    `Kabhi bhi kisi se share / screenshot mat karo.`,
+    ``,
+    `Export karna hai?`,
+  ].join('\n');
+}
+
+/** Send the key message and schedule its 90s auto-delete. */
+async function sendKeyMessage(ctx: Context, chatId: number) {
+  const msg = await ctx.api.sendMessage(
+    chatId,
+    [
+      '🔑 <b>PRIVATE KEY — HANDLE WITH CARE</b>',
+      ``,
+      `Address: <code>${esc(walletInfo.address)}</code>`,
+      `Key: <code>${esc(config.predictfun.privateKey)}</code>`,
+      ``,
+      `⏳ <b>Ye message 90 second mein auto-delete ho jayega.</b>`,
+      `⚠️ Key wallet ko drain kar sakti hai — kisi se share mat karo.`,
+      `ℹ️ Import: MetaMask / Rabby / Trust Wallet → "Import account".`,
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
+  scheduleKeyAutoDelete(ctx.api, chatId, msg.message_id);
+  logger.warn({ userId: ctx.from?.id }, 'Private key exported via Telegram (auto-deletes in 90s)');
+}
 
 export async function handleExport(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
@@ -939,27 +993,20 @@ export async function handleExport(ctx: Context) {
   const userId = ctx.from?.id;
   if (!userId) return;
 
+  // Legacy text confirm still works: /export confirm <code>
   const parts = (ctx.message?.text || '').split(/\s+/);
-  const pending = pendingExports.get(userId);
-
   if (parts[1] === 'confirm') {
+    const pending = pendingExports.get(userId);
     const code = (parts[2] || '').trim();
     if (pending && pending.code === code && Date.now() < pending.expires) {
       pendingExports.delete(userId);
-      logger.warn({ userId }, 'Private key exported via Telegram /export');
-      return ctx.reply(
-        [
-          '🔑 <b>PRIVATE KEY — HANDLE WITH CARE</b>',
-          ``,
-          `Address: <code>${esc(walletInfo.address)}</code>`,
-          `Key: <code>${esc(config.predictfun.privateKey)}</code>`,
-          ``,
-          `⚠️ <b>Ye message ABHI delete kar do</b> — chat history mein key rahegi warna.`,
-          `⚠️ Ye key wallet ko drain kar sakti hai — kisi se share mat karo.`,
-          `ℹ️ Import karne ke liye: MetaMask / Rabby / Trust Wallet → "Import account".`,
-        ].join('\n'),
-        { parse_mode: 'HTML' }
-      );
+      const chatId = ctx.chat?.id;
+      if (!chatId) return;
+      await sendKeyMessage(ctx, chatId);
+      return ctx.reply('✅ Key bhej diya. ⏳ 90 second mein delete ho jayega.', {
+        parse_mode: 'HTML',
+        reply_markup: mainKb(ctx),
+      });
     }
     return ctx.reply('❌ Invalid ya expired code. Naya code ke liye <code>/export</code> chalao.', {
       parse_mode: 'HTML',
@@ -967,22 +1014,65 @@ export async function handleExport(ctx: Context) {
     });
   }
 
+  // Fresh request → issue a code (kept for the text fallback) and show the
+  // Polymarket-style inline confirmation card.
   const code = String(crypto.randomInt(100_000, 1_000_000));
   pendingExports.set(userId, { code, expires: Date.now() + 5 * 60_000 });
-  return ctx.reply(
-    [
-      '⚠️ <b>Private key export — confirm karo</b>',
-      ``,
-      `Ye action tumhari <b>private key</b> is Telegram chat mein bhej dega.`,
-      `Confirm karne ke liye ye bhejo:`,
-      ``,
-      `<code>/export confirm ${code}</code>`,
-      ``,
-      `⏳ Code 5 minute mein expire ho jayega.`,
-      `ℹ️ Wallet: <code>${esc(walletInfo.address)}</code> (${walletInfo.source === 'env' ? '.env' : walletInfo.file})`,
-    ].join('\n'),
-    { parse_mode: 'HTML' }
-  );
+
+  const kb = new InlineKeyboard()
+    .text('✅ Yes, Export', `x:y:${userId}`)
+    .text('❌ Cancel', `x:n:${userId}`);
+  return ctx.reply(buildExportCard(), { parse_mode: 'HTML', reply_markup: kb });
+}
+
+/** Handle x:y:<userId> / x:n:<userId> callback presses on the export card. */
+async function handleExportCallback(ctx: Context, data: string): Promise<boolean> {
+  if (!data.startsWith('x:y:') && !data.startsWith('x:n:')) return false;
+
+  const requester = Number(data.split(':')[2]);
+  if (ctx.from?.id !== requester) {
+    await ctx.answerCallbackQuery({ text: '⛔ Ye card tumhara nahi hai', show_alert: true });
+    return true;
+  }
+
+  // Whitelist is re-checked at press time (config may have changed since).
+  if (config.telegram.allowedUsers.length > 0 && !config.telegram.allowedUsers.includes(requester)) {
+    await ctx.answerCallbackQuery({ text: '⛔ Not authorized', show_alert: true });
+    return true;
+  }
+
+  const chatId = ctx.chat?.id;
+  if (!chatId) return true;
+
+  if (data.startsWith('x:n:')) {
+    pendingExports.delete(requester);
+    await ctx.answerCallbackQuery({ text: 'Cancelled' });
+    try {
+      await ctx.editMessageText('❌ <b>Export cancelled</b> — key bheji nahi gayi.', {
+        parse_mode: 'HTML',
+      });
+    } catch {
+      // card too old to edit — ignore
+    }
+    return true;
+  }
+
+  await ctx.answerCallbackQuery();
+  try {
+    await ctx.editMessageText(
+      [
+        `✅ <b>Key exported</b>`,
+        ``,
+        `Key wala message upar bhej diya gaya hai.`,
+        `⏳ Wo <b>90 second</b> mein auto-delete ho jayega.`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+  } catch {
+    // ignore edit failures
+  }
+  await sendKeyMessage(ctx, chatId);
+  return true;
 }
 
 // ───────────────────────────────────────────────

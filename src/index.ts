@@ -10,6 +10,7 @@ import {
 } from './services/autoServices.js';
 import { predictSigner } from './exchanges/predictfun/signer.js';
 import { stateStore } from './utils/store.js';
+import { startDepositWatcher } from './services/depositWatcher.js';
 
 /** .env holds the bot token + private key: make sure only the owner can read it. */
 function checkEnvPermissions() {
@@ -91,6 +92,9 @@ async function main() {
 
   // Start auto-services (round change notifier + auto-redeem)
   startAutoServices(bot);
+
+  // Watch wallet balances and announce incoming deposits
+  startDepositWatcher(bot);
 
   // Register allowed users for push notifications
   for (const userId of config.telegram.allowedUsers) {

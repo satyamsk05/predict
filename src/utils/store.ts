@@ -22,10 +22,17 @@ export interface PersistedAutoState {
   notifyTargets: Array<{ chatId: number; paused: boolean }>;
 }
 
+/** Last-seen wallet balances, used to detect incoming deposits. */
+export interface PersistedDepositState {
+  usdt: number;
+  bnb: number;
+}
+
 export interface PersistedState {
   version: number;
   risk: PersistedRiskState;
   auto: PersistedAutoState;
+  deposit?: PersistedDepositState;
 }
 
 function emptyState(): PersistedState {
@@ -91,6 +98,10 @@ function sanitize(raw: any): PersistedState {
           .map((t: any) => ({ chatId: t.chatId, paused: t.paused === true }))
       : [],
   };
+
+  if (raw.deposit && Number.isFinite(raw.deposit.usdt) && Number.isFinite(raw.deposit.bnb)) {
+    base.deposit = { usdt: raw.deposit.usdt, bnb: raw.deposit.bnb };
+  }
 
   return base;
 }
