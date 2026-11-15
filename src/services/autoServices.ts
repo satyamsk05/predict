@@ -3,7 +3,6 @@ import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { roundWatcher } from '../services/roundWatcher.js';
 import { predictFunApi } from '../exchanges/predictfun/api.js';
-import { predictSigner } from '../exchanges/predictfun/signer.js';
 import { riskManager } from '../execution/risk.js';
 import type { Bot, Context } from 'grammy';
 import type { ActiveRoundState } from '../services/roundWatcher.js';
@@ -11,6 +10,8 @@ import type { PredictPosition } from '../exchanges/predictfun/types.js';
 import { esc } from '../bot/keyboards.js';
 import { marketUrl, txUrl, linkLine } from '../bot/links.js';
 import { stateStore } from '../utils/store.js';
+import { userAccounts } from '../users/accounts.js';
+import { getUserRuntime } from '../users/runtime.js';
 
 interface NotifyTarget {
   chatId: number;
@@ -281,48 +282,60 @@ export function startAutoServices(bot: Bot<Context>) {
       }
     }, 30000); // Check every 30 seconds
   } else {
-    // LIVE: settle outcomes (win OR loss — the circuit breaker needs losses!)
-    // every cycle; redeeming winners is optional behind AUTO_REDEEM.
+    // LIVE: per-user wallets — settle outcomes (win OR loss — the circuit
+    // breaker needs losses!) for every member; redeeming winners is optional
+    // behind AUTO_REDEEM.
     setInterval(async () => {
       if (redeemInFlight) return;
       redeemInFlight = true;
       try {
-        // 0) Orders placed earlier may have filled since — mark them filled so
-        //    exposure/stats reflect reality.
-        if (riskManager.hasUnfilledTrades()) {
-          try {
-            const all = await predictFunApi.getPositions();
-            for (const pos of all) {
-              if (pos.isResolved) continue;
-              const side = sideOf(pos.outcome);
-              if (side) riskManager.markFilled(pos.marketId, side);
+        for (const acc of userAccounts.all()) {
+          const userId = acc.telegramId;
+          const rt = getUserRuntime(userId);
+          if (!rt) continue;
+
+          // 0) Orders placed earlier may have filled since — mark them filled
+          //    so exposure/stats reflect reality.
+          if (riskManager.hasUnfilledTrades()) {
+            try {
+              const all = await rt.api.getPositions();
+              for (const pos of all) {
+                if (pos.isResolved) continue;
+                const side = sideOf(pos.outcome);
+                if (side) riskManager.markFilled(pos.marketId, side);
+              }
+            } catch (e) {
+              logger.warn({ err: e, userId }, 'Fill reconciliation pass failed');
             }
+          }
+
+          let positions;
+          try {
+            positions = await rt.api.getPositions({ isResolved: true });
           } catch (e) {
-            logger.warn({ err: e }, 'Fill reconciliation pass failed');
+            logger.warn({ err: e, userId }, 'Positions fetch failed — skipping member');
+            continue;
           }
-        }
 
-        const positions = await predictFunApi.getPositions({ isResolved: true });
-
-        // 1) Settle every resolved position (win OR loss) exactly once.
-        for (const pos of positions) {
-          const pnl = positionPnl(pos);
-          if (pnl === null) continue;
-          const settled = riskManager.recordSettlement(pos.marketId, pnl, pos.outcome);
-          if (settled) {
-            logger.info(
-              { marketId: pos.marketId, outcome: pos.outcome, pnl },
-              'Settled trade outcome'
-            );
+          // 1) Settle every resolved position (win OR loss) exactly once.
+          for (const pos of positions) {
+            const pnl = positionPnl(pos);
+            if (pnl === null) continue;
+            const settled = riskManager.recordSettlement(pos.marketId, pnl, pos.outcome, userId);
+            if (settled) {
+              logger.info(
+                { userId, marketId: pos.marketId, outcome: pos.outcome, pnl },
+                'Settled trade outcome'
+              );
+            }
           }
-        }
 
-        // 2) Redeem only winning positions, once each, isolating failures.
-        if (config.trading.autoRedeem) {
+          // 2) Redeem only winning positions, once each, isolating failures.
+          if (!config.trading.autoRedeem) continue;
           for (const pos of positions) {
             if (!pos.conditionId || !pos.isSettled) continue;
 
-            const redeemKey = `${pos.conditionId}|${pos.indexSet ?? '1'}`;
+            const redeemKey = `${userId}|${pos.conditionId}|${pos.indexSet ?? '1'}`;
             if (redeemedKeys.has(redeemKey) || deadRedeems.has(redeemKey)) continue;
 
             const indexSet = pos.indexSet === '2' ? 2 : 1;
@@ -332,11 +345,11 @@ export function startAutoServices(bot: Bot<Context>) {
 
             try {
               logger.info(
-                { conditionId: pos.conditionId, marketId: pos.marketId, isNegRisk: pos.isNegRisk },
+                { userId, conditionId: pos.conditionId, marketId: pos.marketId, isNegRisk: pos.isNegRisk },
                 'Auto-redeeming settled position...'
               );
 
-              const result = await predictSigner.redeemCondition(
+              const result = await rt.signer.redeemCondition(
                 pos.conditionId,
                 indexSet as 1 | 2,
                 !!pos.isNegRisk,
@@ -353,47 +366,53 @@ export function startAutoServices(bot: Bot<Context>) {
                   // redeem (e.g. already redeemed externally, no gas).
                   deadRedeems.add(redeemKey);
                   logger.warn(
-                    { conditionId: pos.conditionId, tries },
+                    { userId, conditionId: pos.conditionId, tries },
                     'Auto-redeem gave up after repeated failures'
                   );
                 }
                 if (!reportedFailures.has(failKey)) {
                   reportedFailures.add(failKey);
                   logger.warn(
-                    { conditionId: pos.conditionId, error: result.error },
+                    { userId, conditionId: pos.conditionId, error: result.error },
                     'Auto-redeem failed'
                   );
-                  await broadcast(
-                    bot,
-                    [
-                      `⚠️ <b>Auto-redeem failed</b>`,
-                      `Market: ${esc(pos.marketTitle || pos.marketId)}`,
-                      `Reason: ${esc(result.error || 'unknown')}`,
-                    ].join('\n')
-                  );
+                  await bot.api
+                    .sendMessage(
+                      userId,
+                      [
+                        `⚠️ <b>Auto-redeem failed</b>`,
+                        `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+                        `Reason: ${esc(result.error || 'unknown')}`,
+                      ].join('\n'),
+                      { parse_mode: 'HTML' }
+                    )
+                    .catch(() => {});
                 }
                 continue;
               }
 
               redeemedKeys.add(redeemKey);
               persistAuto();
-              await broadcast(
-                bot,
-                [
-                  `✅ <b>Position Redeemed!</b>`,
-                  `Market: ${esc(pos.marketTitle || pos.marketId)}`,
-                  `Outcome: ${esc(pos.outcome)}`,
-                  txUrl(result.txHash)
-                    ? `TX: <a href="${txUrl(result.txHash)}">${result.txHash!.slice(0, 10)}…${result.txHash!.slice(-6)}</a> ↗`
-                    : `TX: <code>${result.txHash || 'N/A'}</code>`,
-                ]
-                  .filter(Boolean)
-                  .join('\n')
-              );
+              await bot.api
+                .sendMessage(
+                  userId,
+                  [
+                    `✅ <b>Position Redeemed!</b>`,
+                    `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+                    `Outcome: ${esc(pos.outcome)}`,
+                    txUrl(result.txHash)
+                      ? `TX: <a href="${txUrl(result.txHash)}">${result.txHash!.slice(0, 10)}…${result.txHash!.slice(-6)}</a> ↗`
+                      : `TX: <code>${result.txHash || 'N/A'}</code>`,
+                  ]
+                    .filter(Boolean)
+                    .join('\n'),
+                  { parse_mode: 'HTML' }
+                )
+                .catch(() => {});
             } catch (e: any) {
               // One bad position must not stall the rest of the cycle.
               logger.warn(
-                { err: e, conditionId: pos.conditionId },
+                { err: e, userId, conditionId: pos.conditionId },
                 'Auto-redeem cycle item failed'
               );
             }

@@ -1,10 +1,9 @@
 import type { Bot, Context } from 'grammy';
 import { logger } from '../utils/logger.js';
-import { predictFunApi } from '../exchanges/predictfun/api.js';
 import { stateStore } from '../utils/store.js';
-import { walletInfo } from '../config/index.js';
 import { portfolioUrl, addressUrl, linkLine } from '../bot/links.js';
-import { userRegistry } from '../users/registry.js';
+import { userAccounts } from '../users/accounts.js';
+import { getUserRuntime } from '../users/runtime.js';
 
 /**
  * Deposit watcher: polls the wallet's USDT / BNB balances and notifies
@@ -23,67 +22,74 @@ const MIN_BNB_DELTA = 0.0001;
 
 let timer: NodeJS.Timeout | null = null;
 let started = false;
-let lastUsdt: number | null = null;
-let lastBnb: number | null = null;
+/** Per-user baselines: telegramId → { usdt, bnb }. */
+const baselines = new Map<number, { usdt: number; bnb: number }>();
 
 function loadBaseline() {
-  const saved = stateStore.get().deposit;
-  if (saved && Number.isFinite(saved.usdt) && Number.isFinite(saved.bnb)) {
-    lastUsdt = saved.usdt;
-    lastBnb = saved.bnb;
-    logger.info({ usdt: saved.usdt, bnb: saved.bnb }, 'Restored deposit-watcher baseline');
+  const saved = stateStore.get().depositUsers;
+  if (!saved) return;
+  for (const [id, b] of Object.entries(saved)) {
+    if (Number.isFinite(b.usdt) && Number.isFinite(b.bnb)) {
+      baselines.set(Number(id), { usdt: b.usdt, bnb: b.bnb });
+    }
+  }
+  if (baselines.size) {
+    logger.info({ users: baselines.size }, 'Restored deposit-watcher baselines');
   }
 }
 
 function persistBaseline() {
-  if (lastUsdt == null || lastBnb == null) return;
+  const out: Record<string, { usdt: number; bnb: number }> = {};
+  for (const [id, b] of baselines) out[String(id)] = b;
   stateStore.update((s) => {
-    s.deposit = { usdt: lastUsdt as number, bnb: lastBnb as number };
+    s.depositUsers = out;
   });
 }
 
 async function poll(bot: Bot<Context>) {
-  let bal;
-  try {
-    bal = await predictFunApi.getBalance();
-  } catch {
-    return; // RPC hiccup — keep the previous baseline
-  }
-  if (!bal.ok) return;
+  // Watch every member's own wallet (per-user accounts).
+  for (const acc of userAccounts.all()) {
+    const userId = acc.telegramId;
+    const rt = getUserRuntime(userId);
+    if (!rt) continue;
 
-  const prevUsdt = lastUsdt;
-  const prevBnb = lastBnb;
-  lastUsdt = bal.usdt;
-  lastBnb = bal.bnb;
-  persistBaseline();
+    let bal;
+    try {
+      bal = await rt.api.getBalance();
+    } catch {
+      continue; // RPC hiccup — keep the previous baseline
+    }
+    if (!bal.ok) continue;
 
-  if (prevUsdt == null || prevBnb == null) return; // first poll = baseline only
+    const prev = baselines.get(userId);
+    baselines.set(userId, { usdt: bal.usdt, bnb: bal.bnb });
+    persistBaseline();
 
-  const dUsdt = bal.usdt - prevUsdt;
-  const dBnb = bal.bnb - prevBnb;
+    if (!prev) continue; // first poll = baseline only
 
-  if (dUsdt >= MIN_USDT_DELTA || dBnb >= MIN_BNB_DELTA) {
-    const lines = [
-      `💰 <b>Deposit Received!</b>`,
-      ``,
-      dUsdt >= MIN_USDT_DELTA ? `USDT: <b>+$${dUsdt.toFixed(2)}</b>` : '',
-      dBnb >= MIN_BNB_DELTA ? `BNB: <b>+${dBnb.toFixed(4)}</b>` : '',
-      ``,
-      `New balance: <b>$${bal.usdt.toFixed(2)} USDT</b> · ${bal.bnb.toFixed(4)} BNB`,
-      `Address: <code>${walletInfo.address}</code>`,
-      linkLine(portfolioUrl(walletInfo.address), 'Portfolio on Predict.fun'),
-      linkLine(addressUrl(walletInfo.address), 'View on BSCScan'),
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const dUsdt = bal.usdt - prev.usdt;
+    const dBnb = bal.bnb - prev.bnb;
 
-    // Notify every approved member (multi-user club mode).
-    for (const userId of userRegistry.activeIds()) {
+    if (dUsdt >= MIN_USDT_DELTA || dBnb >= MIN_BNB_DELTA) {
+      const lines = [
+        `💰 <b>Deposit Received!</b>`,
+        ``,
+        dUsdt >= MIN_USDT_DELTA ? `USDT: <b>+$${dUsdt.toFixed(2)}</b>` : '',
+        dBnb >= MIN_BNB_DELTA ? `BNB: <b>+${dBnb.toFixed(4)}</b>` : '',
+        ``,
+        `New balance: <b>$${bal.usdt.toFixed(2)} USDT</b> · ${bal.bnb.toFixed(4)} BNB`,
+        `Address: <code>${acc.address}</code>`,
+        linkLine(portfolioUrl(acc.address), 'Portfolio on Predict.fun'),
+        linkLine(addressUrl(acc.address), 'View on BSCScan'),
+      ]
+        .filter(Boolean)
+        .join('\n');
+
       await bot.api.sendMessage(userId, lines, { parse_mode: 'HTML' }).catch((e) => {
         logger.warn({ err: e, userId }, 'Deposit notify failed');
       });
+      logger.info({ userId, dUsdt, dBnb }, 'Deposit notification sent');
     }
-    logger.info({ dUsdt, dBnb }, 'Deposit notification sent');
   }
 }
 

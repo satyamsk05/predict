@@ -8,6 +8,13 @@ export interface AppConfig {
   telegram: {
     token: string;
     allowedUsers: number[];
+    /**
+     * Optional invite code. When set, a brand-new member must send
+     * `/start <code>` before the bot creates their wallet. Existing members
+     * are unaffected. This prevents strangers from filling all MAX_USERS
+     * slots with throwaway Telegram accounts.
+     */
+    joinCode: string;
   };
   predictfun: {
     apiKey: string;
@@ -32,7 +39,14 @@ export interface AppConfig {
 
 function parseBool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined || value.trim() === '') return fallback;
-  return value.trim().toLowerCase() !== 'false';
+  const v = value.trim().toLowerCase();
+  // `DRY_RUN=0` / `NO` / `OFF` used to be treated as TRUE, which silently
+  // enabled live trading safeguards in the wrong direction (or worse for
+  // AUTO_REDEEM). Accept the common falsy spellings explicitly.
+  if (['false', '0', 'no', 'off', 'n'].includes(v)) return false;
+  if (['true', '1', 'yes', 'on', 'y'].includes(v)) return true;
+  logger.warn({ value }, `Unrecognised boolean "${value}" — falling back to ${fallback}`);
+  return fallback;
 }
 
 /**
@@ -80,11 +94,13 @@ export const config: AppConfig = {
   telegram: {
     token: (process.env.TELEGRAM_BOT_TOKEN || '').trim(),
     allowedUsers,
+    joinCode: (process.env.JOIN_CODE || '').trim(),
   },
   predictfun: {
     apiKey: (process.env.PREDICTFUN_API_KEY || '').trim(),
     privateKey,
-    predictAccount: (process.env.PREDICTFUN_ACCOUNT || '').trim(),    isTestnet,
+    predictAccount: (process.env.PREDICTFUN_ACCOUNT || '').trim(),
+    isTestnet,
     baseUrl: isTestnet
       ? 'https://api-testnet.predict.fun/v1'
       : 'https://api.predict.fun/v1',

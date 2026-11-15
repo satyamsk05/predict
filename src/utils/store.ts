@@ -28,11 +28,15 @@ export interface PersistedDepositState {
   bnb: number;
 }
 
+/** Per-user deposit baselines (per-user wallets): telegramId → balances. */
+export type PersistedDepositUsers = Record<string, { usdt: number; bnb: number }>;
+
 export interface PersistedState {
   version: number;
   risk: PersistedRiskState;
   auto: PersistedAutoState;
   deposit?: PersistedDepositState;
+  depositUsers?: PersistedDepositUsers;
 }
 
 function emptyState(): PersistedState {
@@ -105,6 +109,17 @@ function sanitize(raw: any): PersistedState {
 
   if (raw.deposit && Number.isFinite(raw.deposit.usdt) && Number.isFinite(raw.deposit.bnb)) {
     base.deposit = { usdt: raw.deposit.usdt, bnb: raw.deposit.bnb };
+  }
+
+  if (raw.depositUsers && typeof raw.depositUsers === 'object') {
+    const out: PersistedDepositUsers = {};
+    for (const [id, b] of Object.entries(raw.depositUsers as any)) {
+      const bb: any = b;
+      if (bb && Number.isFinite(bb.usdt) && Number.isFinite(bb.bnb)) {
+        out[id] = { usdt: bb.usdt, bnb: bb.bnb };
+      }
+    }
+    base.depositUsers = out;
   }
 
   return base;

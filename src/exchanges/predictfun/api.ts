@@ -1,6 +1,7 @@
 import { Wallet, ethers } from 'ethers';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
+import { getProvider } from '../../utils/provider.js';
 import type {
   PredictMarket,
   PredictOrderbook,
@@ -45,11 +46,12 @@ function normalizePosition(raw: any): PredictPosition | null {
 
     const outcomeStatus = raw.outcome?.status;
     const tradingStatus = raw.market?.tradingStatus || raw.market?.status;
+    const statusUpper = typeof outcomeStatus === 'string' ? outcomeStatus.toUpperCase() : '';
     const isResolved =
       raw.isResolved === true ||
-      tradingStatus === 'RESOLVED' ||
-      outcomeStatus === 'WON' ||
-      outcomeStatus === 'LOST';
+      String(tradingStatus || '').toUpperCase() === 'RESOLVED' ||
+      statusUpper === 'WON' ||
+      statusUpper === 'LOST';
 
     return {
       marketId: String(raw.market.id),
@@ -68,8 +70,8 @@ function normalizePosition(raw: any): PredictPosition | null {
       isNegRisk: !!raw.market.isNegRisk,
       isYieldBearing: !!raw.market.isYieldBearing,
       indexSet: raw.outcome.indexSet != null ? String(raw.outcome.indexSet) : undefined,
-      outcomeStatus: typeof outcomeStatus === 'string' ? outcomeStatus : undefined,
-      isSettled: outcomeStatus === 'WON',
+      outcomeStatus: statusUpper || undefined,
+      isSettled: statusUpper === 'WON',
       isResolved,
       pnlUsd: raw.pnlUsd != null ? String(raw.pnlUsd) : undefined,
       valueUsd: raw.valueUsd != null ? String(raw.valueUsd) : undefined,
@@ -106,21 +108,32 @@ class PredictFunApi {
   private jwtExpiresAt: number = 0;
   private wallet: Wallet | null = null;
   private authFailUntil: number = 0;
+  /** Optional Predict Account (smart wallet). Per-user instances are EOA-only. */
+  private predictAccount: string | undefined;
 
-  constructor() {
-    if (config.predictfun.privateKey) {
+  constructor(opts: { privateKey?: string; predictAccount?: string } = {}) {
+    const privateKey = opts.privateKey !== undefined ? opts.privateKey : config.predictfun.privateKey;
+
+    // Important: an explicit `predictAccount: undefined` must mean "no Predict
+    // Account" (per-user EOA wallets). Checking `!== undefined` here used to
+    // silently inherit the owner's smart wallet for every member.
+    const predictAccount = Object.prototype.hasOwnProperty.call(opts, 'predictAccount')
+      ? opts.predictAccount
+      : config.predictfun.predictAccount;
+    this.predictAccount = (predictAccount || '').trim() || undefined;
+
+    if (privateKey) {
       try {
-        const provider = new ethers.JsonRpcProvider(config.predictfun.rpcUrl);
-        // Public RPCs rate-limit hard; keep polling reasonable (override with
-        // RPC_POLLING_MS, e.g. 300 for a private endpoint).
-        const pollingMs = Number(process.env.RPC_POLLING_MS || 1000);
-        (provider as any).pollingInterval =
-          Number.isFinite(pollingMs) && pollingMs >= 100 ? Math.round(pollingMs) : 1000;
-        this.wallet = new Wallet(config.predictfun.privateKey, provider);
+        this.wallet = new Wallet(privateKey, getProvider());
       } catch (e) {
         logger.warn('Could not initialize wallet with provided private key');
       }
     }
+  }
+
+  /** Predict Account (smart wallet) used by this instance, if any. */
+  public getPredictAccount(): string | undefined {
+    return this.predictAccount;
   }
 
   public getWalletAddress(): string | null {
@@ -132,7 +145,7 @@ class PredictFunApi {
    * the EOA only signs — USDT/positions live on the deposit address.
    */
   public getEffectiveAddress(): string | null {
-    return config.predictfun.predictAccount || (this.wallet ? this.wallet.address : null);
+    return this.predictAccount || (this.wallet ? this.wallet.address : null);
   }
 
   public getWallet(): Wallet | null {
@@ -190,7 +203,13 @@ class PredictFunApi {
       let signature: string;
       let signerAddress: string;
 
-      if (config.predictfun.predictAccount) {
+      if (this.predictAccount) {
+        // The OrderBuilder that signs Predict Account messages lives on the
+        // global signer (backed by the master wallet). A per-user EOA instance
+        // must never take this branch — that would sign with the wrong key.
+        if (this !== predictFunApi) {
+          throw new Error('Predict Account auth is only supported by the global API instance');
+        }
         const { predictSigner } = await import('./signer.js');
         await predictSigner.init();
         const builder = predictSigner.getOrderBuilder();
@@ -198,7 +217,7 @@ class PredictFunApi {
           throw new Error('OrderBuilder required to sign Predict Account auth message');
         }
         signature = await builder.signPredictAccountMessage(message);
-        signerAddress = config.predictfun.predictAccount;
+        signerAddress = this.predictAccount;
       } else {
         signature = await this.wallet.signMessage(message);
         signerAddress = this.wallet.address;
@@ -530,4 +549,5 @@ class PredictFunApi {
   }
 }
 
+export { PredictFunApi };
 export const predictFunApi = new PredictFunApi();

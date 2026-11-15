@@ -28,8 +28,10 @@ import {
   isNotifyPaused,
 } from '../services/autoServices.js';
 import { parseBetText } from './betText.js';
-import { marketUrl, portfolioUrl, addressUrl, linkLine } from './links.js';
+import { marketUrl, portfolioUrl, addressUrl, txUrl, linkLine } from './links.js';
 import { userRegistry } from '../users/registry.js';
+import { userAccounts } from '../users/accounts.js';
+import { getUserRuntime, dropUserRuntime } from '../users/runtime.js';
 
 type BetDraft = {
   outcome?: 'UP' | 'DOWN';
@@ -42,6 +44,13 @@ type BetDraft = {
 };
 
 const betDraft: Map<number, BetDraft> = new Map();
+
+/**
+ * Withdrawal flow state: 🏦 Wallet → 💸 Withdraw → paste address → amount
+ * (or `all`) → inline Confirm → USDT sent + BSCScan link.
+ */
+type WithdrawDraft = { address?: string; amount?: 'all' | number };
+const withdrawDrafts: Map<number, WithdrawDraft> = new Map();
 
 /**
  * Open positions shown in `/positions`, keyed by a short id so the inline
@@ -119,32 +128,15 @@ function fmtPct(p: PositionPnl): string {
 function isAllowed(ctx: Context): boolean {
   const userId = ctx.from?.id;
   if (!userId) return false;
-  // Open mode (no whitelist configured) — single-owner behaviour unchanged.
-  if (config.telegram.allowedUsers.length === 0) return true;
-  // Multi-user club mode: approved members + admins only.
-  return userRegistry.hasAccess(userId);
+  // Auto-join: any user is allowed (member cap applies; no admin approval).
+  return userRegistry.ensureUser(userId, ctx.from?.username) === 'active';
 }
 
-/**
- * Unauthorised user → file an access request (max 10 members) and ping the
- * admins with an /approve hint. Idempotent: pending users get a gentle nudge.
- */
+/** Member cap reached — no slots left. */
 async function notAllowed(ctx: Context) {
   const userId = ctx.from?.id;
-  if (!userId) return ctx.reply('⛔ You are not authorized to use this bot.');
-
-  const result = await userRegistry.requestAccess(userId, ctx.from?.username);
-
-  if (result === 'active') {
-    // Race: approved between the check and here — just continue.
-    return;
-  }
-  if (result === 'pending') {
-    return ctx.reply(
-      '⏳ <b>Access request already pending.</b>\nAdmin approval ka wait karo — approve hote hi message milega.',
-      { parse_mode: 'HTML' }
-    );
-  }
+  const already = userId != null && userRegistry.hasAccess(userId);
+  if (already) return;
   return ctx.reply(
     [
       '⛔ <b>Bot full hai</b>',
@@ -157,55 +149,14 @@ async function notAllowed(ctx: Context) {
 }
 
 // ───────────────────────────────────────────────
-// Admin commands — /approve, /users, /kick (max 10 members)
+// Admin commands — /users, /kick (member cap hygiene)
+// No approval flow: /start auto-creates every member's account.
 // ───────────────────────────────────────────────
 function adminGate(ctx: Context): boolean {
   const userId = ctx.from?.id;
   if (!userId) return false;
   if (config.telegram.allowedUsers.length === 0) return true; // open mode = owner
   return userRegistry.isAdmin(userId);
-}
-
-export async function handleApprove(ctx: Context) {
-  if (!adminGate(ctx)) return notAllowed(ctx);
-
-  const id = Number((ctx.message?.text || '').split(/\s+/)[1]);
-  if (!Number.isFinite(id) || id <= 0) {
-    const pending = userRegistry.all().filter((u) => u.status === 'pending');
-    const lines = pending.length
-      ? ['🆕 <b>Pending requests:</b>', '']
-      : ['🆕 <b>Pending requests:</b> koi nahi', ''];
-    for (const u of pending) {
-      lines.push(`• ${u.username ? '@' + u.username : 'anon'} — <code>${u.telegramId}</code>`);
-    }
-    lines.push('', `Usage: <code>/approve &lt;userId&gt;</code>`);
-    return ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
-  }
-
-  const approved = userRegistry.approve(id);
-  if (!approved) {
-    return ctx.reply(`❌ <code>${id}</code> ke liye koi pending request nahi mili.`, {
-      parse_mode: 'HTML',
-      reply_markup: mainKb(ctx),
-    });
-  }
-
-  await ctx.reply(
-    `✅ <b>Approved!</b> ${approved.username ? '@' + approved.username : `id ${id}`} ab bot use kar sakta hai.`,
-    { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
-  );
-  await ctx.api
-    .sendMessage(
-      id,
-      [
-        `✅ <b>Access approved!</b>`,
-        ``,
-        `Ab tum is bot se BTC 5M trading kar sakte ho.`,
-        `/start dabao aur shuru karo 🚀`,
-      ].join('\n'),
-      { parse_mode: 'HTML' }
-    )
-    .catch(() => {});
 }
 
 export async function handleUsers(ctx: Context) {
@@ -224,13 +175,12 @@ export async function handleUsers(ctx: Context) {
   }
   for (const u of members) {
     const s = userRegistry.getStats(u.telegramId);
-    const tag = u.status === 'pending' ? '⏳ pending' : '✅';
     lines.push(
-      `${tag} ${u.username ? '@' + u.username : 'anon'} (<code>${u.telegramId}</code>) — ` +
+      `✅ ${u.username ? '@' + u.username : 'anon'} (<code>${u.telegramId}</code>) — ` +
         `${s.trades} trades · PnL ${s.pnlUsd >= 0 ? '+' : ''}$${s.pnlUsd.toFixed(2)}`
     );
   }
-  lines.push('', `/approve &lt;id&gt; · /kick &lt;id&gt;`);
+  lines.push('', `/kick &lt;id&gt; — member remove (slot free)`);
   await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
 }
 
@@ -255,6 +205,7 @@ export async function handleKick(ctx: Context) {
       reply_markup: mainKb(ctx),
     });
   }
+  dropUserRuntime(id);
 
   await ctx.reply(`🚫 <code>${id}</code> ko remove kar diya.`, { reply_markup: mainKb(ctx) });
   await ctx.api
@@ -277,19 +228,57 @@ function clearDraft(userId: number) {
 // /start + Live dashboard
 // ───────────────────────────────────────────────
 export async function handleStart(ctx: Context) {
-  if (!isAllowed(ctx)) return notAllowed(ctx);
+  const userId = ctx.from?.id;
+  if (!userId) return;
 
-  if (ctx.chat?.id) {
-    registerNotifyTarget(ctx.chat.id);
+  // Cap check (max members, no approval needed — auto-create).
+  const access = userRegistry.ensureUser(userId, ctx.from?.username);
+  if (access === 'full') {
+    return ctx.reply(
+      [
+        '⛔ <b>Bot full hai</b>',
+        ``,
+        `Is bot par max <b>${userRegistry.maxUsers()} members</b> allowed hain.`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
   }
-  if (ctx.from?.id) clearDraft(ctx.from.id);
+  if (ctx.chat?.id) registerNotifyTarget(ctx.chat.id);
+  clearDraft(userId);
+
+  // Every member gets their own fresh trading wallet, auto-created.
+  const { account, created } = userAccounts.ensureAccount(userId, ctx.from?.username);
+  if (!account) return;
+
+  if (created) {
+    const welcome = [
+      `🎉 <b>Welcome! Aapka trading account ban gaya.</b>`,
+      ``,
+      `💳 <b>Aapka wallet (sirf aapka):</b>`,
+      `<code>${account.address}</code>`,
+      linkLine(addressUrl(account.address), 'View on BSCScan'),
+      ``,
+      `1️⃣ Is address par <b>USDT (BEP-20)</b> + thoda <b>BNB</b> (gas) bhejo.`,
+      `2️⃣ 🏦 Wallet button se balance check karo.`,
+      `3️⃣ ⚡ Quick Bet se BTC 5M up/down trading shuru!`,
+      ``,
+      `🔒 Private key encrypted hai — chahiye to <code>/export</code>`,
+      `💸 Withdraw karne ke liye: 🏦 Wallet → 💸 Withdraw`,
+    ].join('\n');
+    return ctx.reply(welcome, {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
 
   const round = roundWatcher.getCurrentRound();
   let balance: number | undefined;
-
   try {
-    const bal = await predictFunApi.getBalance();
-    balance = bal.ok ? bal.usdt : undefined;
+    const rt = getUserRuntime(userId);
+    if (rt) {
+      const bal = await rt.api.getBalance();
+      balance = bal.ok ? bal.usdt : undefined;
+    }
   } catch {
     balance = undefined;
   }
@@ -330,7 +319,7 @@ export async function handleHelp(ctx: Context) {
     `<b>Circuit:</b> ${stats.isTripped ? '🚨 TRIPPED' : '✅ Armed'}`,
     '',
     'Commands still work: /up 10 · /down 10 · /reset',
-    'Admin: /users · /approve <id> · /kick <id>',
+    'Admin: /users · /kick <id>',
     '',
     '<b>⚡ Fast typing:</b>',
     '<code>up 5 45</code> → $5 UP @ 45¢ (limit)',
@@ -503,6 +492,8 @@ export async function handleCallbackQuery(ctx: Context) {
   try {
     // Export card buttons (x:y:<userId> / x:n:<userId>)
     if (await handleExportCallback(ctx, data)) return;
+    // Withdraw flow buttons (w:s / w:go / w:no)
+    if (await handleWithdrawCallback(ctx, data)) return;
 
     if (data === 'p:l') {
       await ctx.answerCallbackQuery();
@@ -638,6 +629,14 @@ async function closePosition(ctx: Context, key: string) {
     );
   }
 
+  const owner = ctx.from?.id;
+  const rt = owner ? getUserRuntime(owner) : null;
+  if (!rt) {
+    return ctx.editMessageText('❌ Account wallet load nahi hua — thodi der baad try karo.', {
+      reply_markup: buildPositionActionsInline(key),
+    });
+  }
+
   const q = positionPnl(pos, bid);
 
   await ctx.editMessageText(
@@ -646,8 +645,8 @@ async function closePosition(ctx: Context, key: string) {
   );
 
   try {
-    await predictSigner.init();
-    const result = await predictSigner.placeSell(market, side, pos.shares, bid);
+    await rt.signer.init();
+    const result = await rt.signer.placeSell(market, side, pos.shares, bid);
 
     if (!result.success) {
       riskManager.recordFailure(result.error || 'Sell failed');
@@ -658,7 +657,7 @@ async function closePosition(ctx: Context, key: string) {
     }
 
     // Position is closed — let the risk manager account for the realised PnL.
-    if (q.known) riskManager.recordSettlement(pos.marketId, q.pnl, side);
+    if (q.known) riskManager.recordSettlement(pos.marketId, q.pnl, side, owner);
     positionCache.delete(key);
 
     logger.info(
@@ -777,10 +776,18 @@ async function placeOrder(
     );
   }
 
+  // Per-user runtime: balance & signing are isolated to this member's wallet.
+  const rt = userId ? getUserRuntime(userId) : null;
+  if (!rt) {
+    return ctx.reply('❌ Pehle /start dabao — tumhara trading account ban jayega.', {
+      reply_markup: mainKb(ctx),
+    });
+  }
+
   // Pre-flight: never send a live order the wallet cannot fund, and keep gas
   // for approvals/settlement.
   try {
-    const bal = await predictFunApi.getBalance();
+    const bal = await rt.api.getBalance();
     // A failed balance fetch is not the same as an empty wallet — skip the
     // pre-flight rather than blocking/allowing on bogus data.
     if (bal.ok) {
@@ -814,8 +821,8 @@ async function placeOrder(
   });
 
   try {
-    await predictSigner.init();
-    const result = await predictSigner.placeBet(round.rawMarket, outcome, amountUsdt, price);
+    await rt.signer.init();
+    const result = await rt.signer.placeBet(round.rawMarket, outcome, amountUsdt, price);
 
     if (result.success) {
       // A placed limit order is NOT a filled position — record it unfilled and
@@ -853,7 +860,7 @@ async function placeOrder(
       );
 
       // Fire-and-forget fill confirmation (5s × 3 attempts).
-      void confirmFillAndNotify(ctx, ctx.chat!.id, round.marketId, outcome);
+      void confirmFillAndNotify(ctx, ctx.chat!.id, round.marketId, outcome, userId);
     } else {
       riskManager.recordFailure(result.error || 'Unknown error');
       await ctx.api.editMessageText(
@@ -883,12 +890,15 @@ async function confirmFillAndNotify(
   ctx: Context,
   chatId: number,
   marketId: string,
-  outcome: 'UP' | 'DOWN'
+  outcome: 'UP' | 'DOWN',
+  userId?: number
 ) {
+  const rt = userId ? getUserRuntime(userId) : null;
+  if (!rt) return;
   for (let attempt = 0; attempt < 3; attempt++) {
     await sleep(5000);
     try {
-      const positions = await predictFunApi.getPositions();
+      const positions = await rt.api.getPositions();
       const filled = positions.some(
         (p) =>
           p.marketId === marketId &&
@@ -926,28 +936,41 @@ async function confirmFillAndNotify(
 export async function handleBalance(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
 
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  userAccounts.ensureAccount(userId, ctx.from?.username);
+  const rt = getUserRuntime(userId);
+  if (!rt) {
+    return ctx.reply('❌ Account wallet load nahi hua. Thodi der baad try karo.', {
+      reply_markup: mainKb(ctx),
+    });
+  }
+
   try {
-    const { usdt, bnb, ok } = await predictFunApi.getBalance();
+    const { usdt, bnb, ok } = await rt.api.getBalance();
     if (!ok) {
       return ctx.reply('❌ Balance fetch nahi ho paya (RPC error). Thodi der baad try karo.', {
         reply_markup: mainKb(ctx),
       });
     }
-    const address = predictFunApi.getEffectiveAddress();
+    const address = rt.api.getEffectiveAddress();
+    const kb = new InlineKeyboard().text('💸 Withdraw', 'w:s');
     await ctx.reply(
       [
-        `🏦 <b>Wallet Balance</b>`,
+        `🏦 <b>Aapka Wallet</b>`,
         ``,
         `USDT: <b>$${usdt.toFixed(2)}</b>`,
         `BNB:  <b>${bnb.toFixed(4)} BNB</b> (gas)`,
         address ? `\nAddress: <code>${address}</code>` : '',
         linkLine(portfolioUrl(address), 'Portfolio on Predict.fun'),
         linkLine(addressUrl(address), 'View on BSCScan'),
+        ``,
+        `💸 Withdraw karne ke liye button dabao.`,
       ]
         .filter(Boolean)
         .join('\n')
         .trim(),
-      { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+      { parse_mode: 'HTML', reply_markup: kb }
     );
   } catch (e: any) {
     await ctx.reply(`❌ Could not fetch balance: ${esc(e.message)}`, {
@@ -965,9 +988,18 @@ export async function handlePositions(ctx: Context) {
 
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  const rt = getUserRuntime(userId);
+  if (!rt) {
+    return ctx.reply('❌ Account wallet load nahi hua. Thodi der baad try karo.', {
+      reply_markup: mainKb(ctx),
+    });
+  }
 
   try {
-    const positions = await predictFunApi.getPositions();
+    const positions = await rt.api.getPositions();
     const open = positions.filter((p) => !p.isResolved);
     if (open.length === 0) {
       return ctx.reply('📦 No open positions found.', { reply_markup: mainKb(ctx) });
@@ -1110,12 +1142,11 @@ function scheduleKeyAutoDelete(api: Context['api'], chatId: number, messageId: n
   }, EXPORT_KEY_DELETE_MS);
 }
 
-function buildExportCard() {
+function buildExportCard(address: string) {
   return [
     '🔐 <b>Export Private Key</b>',
     ``,
-    `Wallet: <code>${esc(walletInfo.address)}</code>`,
-    `Source: ${walletInfo.source === 'env' ? '.env' : esc(walletInfo.file)}`,
+    `Wallet: <code>${esc(address)}</code>`,
     ``,
     `⚠️ <b>WARNING:</b> Your private key gives FULL access to this wallet and its funds.`,
     `Kabhi bhi kisi se share / screenshot mat karo.`,
@@ -1125,14 +1156,19 @@ function buildExportCard() {
 }
 
 /** Send the key message and schedule its 90s auto-delete. */
-async function sendKeyMessage(ctx: Context, chatId: number) {
+async function sendKeyMessage(
+  ctx: Context,
+  chatId: number,
+  address: string,
+  key: string
+) {
   const msg = await ctx.api.sendMessage(
     chatId,
     [
       '🔑 <b>PRIVATE KEY — HANDLE WITH CARE</b>',
       ``,
-      `Address: <code>${esc(walletInfo.address)}</code>`,
-      `Key: <code>${esc(config.predictfun.privateKey)}</code>`,
+      `Address: <code>${esc(address)}</code>`,
+      `Key: <code>${esc(key)}</code>`,
       ``,
       `⏳ <b>Ye message 90 second mein auto-delete ho jayega.</b>`,
       `⚠️ Key wallet ko drain kar sakti hai — kisi se share mat karo.`,
@@ -1141,25 +1177,33 @@ async function sendKeyMessage(ctx: Context, chatId: number) {
     { parse_mode: 'HTML' }
   );
   scheduleKeyAutoDelete(ctx.api, chatId, msg.message_id);
-  logger.warn({ userId: ctx.from?.id }, 'Private key exported via Telegram (auto-deletes in 90s)');
+  logger.warn(
+    { userId: ctx.from?.id },
+    'User private key exported via Telegram (auto-deletes in 90s)'
+  );
 }
 
 export async function handleExport(ctx: Context) {
-  // The trading wallet is shared by the club — only the owner/admin may
-  // ever see its key.
-  if (!adminGate(ctx)) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  // Every member exports their OWN wallet key (encrypted at rest).
+  const acc = userAccounts.get(userId);
+  if (!acc) {
+    return ctx.reply('❌ Pehle /start dabao — tumhara trading account ban jayega.', {
+      reply_markup: mainKb(ctx),
+    });
+  }
+  const key = userAccounts.getPrivateKey(userId);
+  if (!key) {
     return ctx.reply(
-      '⛔ <b>Export admin-only hai</b> — wallet sab members ka shared trading wallet hai.',
+      '❌ Key decrypt nahi hui — admin se WALLET_MASTER_KEY check karwao (agar server migration hui hai to).',
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
     );
   }
 
-  if (!config.predictfun.privateKey) {
-    return ctx.reply('❌ Koi wallet configured nahi hai.', { reply_markup: mainKb(ctx) });
-  }
-
-  const userId = ctx.from?.id;
-  if (!userId) return;
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
 
   // Legacy text confirm still works: /export confirm <code>
   const parts = (ctx.message?.text || '').split(/\s+/);
@@ -1168,9 +1212,7 @@ export async function handleExport(ctx: Context) {
     const code = (parts[2] || '').trim();
     if (pending && pending.code === code && Date.now() < pending.expires) {
       pendingExports.delete(userId);
-      const chatId = ctx.chat?.id;
-      if (!chatId) return;
-      await sendKeyMessage(ctx, chatId);
+      await sendKeyMessage(ctx, chatId, acc.address, key);
       return ctx.reply('✅ Key bhej diya. ⏳ 90 second mein delete ho jayega.', {
         parse_mode: 'HTML',
         reply_markup: mainKb(ctx),
@@ -1190,7 +1232,7 @@ export async function handleExport(ctx: Context) {
   const kb = new InlineKeyboard()
     .text('✅ Yes, Export', `x:y:${userId}`)
     .text('❌ Cancel', `x:n:${userId}`);
-  return ctx.reply(buildExportCard(), { parse_mode: 'HTML', reply_markup: kb });
+  return ctx.reply(buildExportCard(acc.address), { parse_mode: 'HTML', reply_markup: kb });
 }
 
 /** Handle x:y:<userId> / x:n:<userId> callback presses on the export card. */
@@ -1200,12 +1242,6 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
   const requester = Number(data.split(':')[2]);
   if (ctx.from?.id !== requester) {
     await ctx.answerCallbackQuery({ text: '⛔ Ye card tumhara nahi hai', show_alert: true });
-    return true;
-  }
-
-  // Whitelist is re-checked at press time (config may have changed since).
-  if (config.telegram.allowedUsers.length > 0 && !config.telegram.allowedUsers.includes(requester)) {
-    await ctx.answerCallbackQuery({ text: '⛔ Not authorized', show_alert: true });
     return true;
   }
 
@@ -1225,6 +1261,13 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
     return true;
   }
 
+  const acc = userAccounts.get(requester);
+  const key = acc ? userAccounts.getPrivateKey(requester) : null;
+  if (!acc || !key) {
+    await ctx.answerCallbackQuery({ text: '❌ Wallet not found', show_alert: true });
+    return true;
+  }
+
   await ctx.answerCallbackQuery();
   try {
     await ctx.editMessageText(
@@ -1239,7 +1282,225 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
   } catch {
     // ignore edit failures
   }
-  await sendKeyMessage(ctx, chatId);
+  await sendKeyMessage(ctx, chatId, acc.address, key);
+  return true;
+}
+
+// ───────────────────────────────────────────────
+// 💸 Withdraw flow (inline buttons + confirm)
+// ───────────────────────────────────────────────
+function isValidBscAddress(addr: string): boolean {
+  return /^0x[0-9a-fA-F]{40}$/.test(addr);
+}
+
+async function handleWithdrawCallback(ctx: Context, data: string): Promise<boolean> {
+  if (data !== 'w:s' && data !== 'w:go' && data !== 'w:no') return false;
+
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  if (!userId || !chatId) return true;
+
+  const draft = withdrawDrafts.get(userId);
+
+  if (data === 'w:s') {
+    // Start: ask for destination address.
+    withdrawDrafts.set(userId, {});
+    const rt = getUserRuntime(userId);
+    let usdt: number | undefined;
+    try {
+      if (rt) {
+        const bal = await rt.api.getBalance();
+        if (bal.ok) usdt = bal.usdt;
+      }
+    } catch {
+      // balance optional here
+    }
+    await ctx.answerCallbackQuery();
+    await ctx.api.sendMessage(
+      chatId,
+      [
+        `💸 <b>Withdraw USDT</b>`,
+        ``,
+        usdt !== undefined ? `Balance: <b>$${usdt.toFixed(2)} USDT</b>` : '',
+        ``,
+        `1️⃣ Apna destination address <b>paste karo</b> (BEP-20 USDT wallet — Binance/OKX deposit address ya apna MetaMask address).`,
+        `2️⃣ Phir amount mangege — ya <code>all</code> likh dena (sab balance).`,
+        `3️⃣ ✅ Confirm karo → USDT bhej diya jayega.`,
+        ``,
+        `❌ Cancel karne ke liye <code>cancel</code> likho.`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      { parse_mode: 'HTML' }
+    );
+    return true;
+  }
+
+  if (data === 'w:no') {
+    withdrawDrafts.delete(userId);
+    await ctx.answerCallbackQuery({ text: 'Cancelled' });
+    try {
+      await ctx.editMessageText('❌ <b>Withdrawal cancelled</b> — kuch bheja nahi gaya.', {
+        parse_mode: 'HTML',
+      });
+    } catch {
+      // old message — ignore
+    }
+    return true;
+  }
+
+  // w:go — confirmed send
+  if (!draft?.address || draft.amount === undefined) {
+    await ctx.answerCallbackQuery({ text: '⚠️ Flow expired — 🏦 Wallet → 💸 Withdraw se dobara', show_alert: true });
+    return true;
+  }
+
+  await ctx.answerCallbackQuery({ text: 'Sending…' });
+  try {
+    await ctx.editMessageText('⏳ <b>Sending USDT…</b>', { parse_mode: 'HTML' });
+  } catch {
+    // ignore
+  }
+
+  try {
+    const hash = await userAccounts.sendUsdt(
+      userId,
+      draft.address,
+      draft.amount === 'all' ? -1 : draft.amount
+    );
+    withdrawDrafts.delete(userId);
+    await ctx.api.sendMessage(
+      chatId,
+      [
+        `✅ <b>Sent Done!</b>`,
+        ``,
+        `Amount: <b>${draft.amount === 'all' ? 'Full balance' : `$${draft.amount.toFixed(2)} USDT`}</b>`,
+        `To: <code>${draft.address}</code>`,
+        txUrl(hash)
+          ? `TX: <a href="${txUrl(hash)}">${hash.slice(0, 10)}…${hash.slice(-6)}</a> ↗`
+          : `TX: <code>${hash}</code>`,
+        ``,
+        `ℹ️ 1-2 minute me destination par pahuch jayega.`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+  } catch (e: any) {
+    logger.warn({ err: e, userId }, 'Withdrawal failed');
+    withdrawDrafts.delete(userId);
+    await ctx.api.sendMessage(
+      chatId,
+      [
+        `❌ <b>Withdrawal failed</b>`,
+        ``,
+        esc(e?.message || String(e)),
+        ``,
+        `Dobara try karo: 🏦 Wallet → 💸 Withdraw`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+  }
+  return true;
+}
+
+/** Text messages typed during the withdraw flow (address / amount / cancel). */
+async function handleWithdrawText(ctx: Context, userId: number, raw: string): Promise<boolean> {
+  const draft = withdrawDrafts.get(userId);
+  if (!draft) return false;
+
+  const text = raw.trim();
+
+  if (text.toLowerCase() === 'cancel') {
+    withdrawDrafts.delete(userId);
+    await ctx.reply('❌ <b>Withdrawal cancelled</b> — kuch bheja nahi gaya.', {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+    return true;
+  }
+
+  // Step 1: destination address
+  if (!draft.address) {
+    const addr = text.replace(/\s+/g, '');
+    if (!isValidBscAddress(addr)) {
+      await ctx.reply(
+        '❌ Ye valid BEP-20 address nahi lag raha (0x + 40 hex chars).\nDobara paste karo ya <code>cancel</code> likho.',
+        { parse_mode: 'HTML' }
+      );
+      return true;
+    }
+    draft.address = addr;
+    await ctx.reply(
+      [
+        `✅ Address set: <code>${addr}</code>`,
+        ``,
+        `2️⃣ Ab <b>amount likho</b> (USDT me, e.g. <code>10</code>)`,
+        `ya <code>all</code> likho — pura balance withdraw hoga.`,
+        ``,
+        `<code>cancel</code> se cancel karo.`,
+      ].join('\n'),
+      { parse_mode: 'HTML' }
+    );
+    return true;
+  }
+
+  // Step 2: amount
+  const rt = getUserRuntime(userId);
+  if (!rt) {
+    withdrawDrafts.delete(userId);
+    await ctx.reply('❌ Account wallet load nahi hua. Dobara try karo.', {
+      reply_markup: mainKb(ctx),
+    });
+    return true;
+  }
+  let balance = 0;
+  try {
+    const bal = await rt.api.getBalance();
+    if (!bal.ok) throw new Error('Balance fetch nahi hua — thodi der baad try karo');
+    balance = bal.usdt;
+  } catch (e: any) {
+    withdrawDrafts.delete(userId);
+    await ctx.reply(`❌ ${esc(e?.message || 'Balance error')}`, { parse_mode: 'HTML' });
+    return true;
+  }
+
+  let amount: 'all' | number;
+  if (/^all$/i.test(text)) {
+    amount = 'all';
+  } else {
+    const n = parseFloat(text);
+    if (!(n > 0)) {
+      await ctx.reply('❌ Invalid amount. Number likho (e.g. <code>10</code>) ya <code>all</code>.', {
+        parse_mode: 'HTML',
+      });
+      return true;
+    }
+    if (n > balance + 1e-9) {
+      await ctx.reply(
+        `❌ Wallet me sirf <b>$${balance.toFixed(2)} USDT</b> hai. Kam likho ya <code>all</code>.`,
+        { parse_mode: 'HTML' }
+      );
+      return true;
+    }
+    amount = n;
+  }
+
+  draft.amount = amount;
+  const amountStr = amount === 'all' ? `Full balance ($${balance.toFixed(2)})` : `$${amount.toFixed(2)}`;
+  const kb = new InlineKeyboard()
+    .text('✅ Confirm & Send', 'w:go')
+    .text('❌ Cancel', 'w:no');
+  await ctx.reply(
+    [
+      `💸 <b>Confirm Withdrawal</b>`,
+      ``,
+      `Amount: <b>${amountStr} USDT</b>`,
+      `To: <code>${draft.address}</code>`,
+      ``,
+      `⚠️ Sirf BEP-20 addresses pe bhej rahe hain — galat network par funds lag sakte hain.`,
+      `✅ Confirm dabao → USDT send ho jayega.`,
+    ].join('\n'),
+    { parse_mode: 'HTML', reply_markup: kb }
+  );
   return true;
 }
 
@@ -1366,6 +1627,10 @@ export async function handleTextMessage(ctx: Context) {
 
   const text = ctx.message?.text?.trim() || '';
   if (!text || text.startsWith('/')) return;
+
+  // Withdrawal flow input (address / amount / cancel) takes priority over
+  // bet parsing — an amount like "10" would otherwise become a bet.
+  if (await handleWithdrawText(ctx, userId, text)) return;
 
   const draft = betDraft.get(userId);
 

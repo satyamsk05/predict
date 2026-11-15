@@ -8,7 +8,6 @@ import {
   registerNotifyTarget,
   restoreAutoState,
 } from './services/autoServices.js';
-import { predictSigner } from './exchanges/predictfun/signer.js';
 import { stateStore } from './utils/store.js';
 import { startDepositWatcher } from './services/depositWatcher.js';
 import { userRegistry } from './users/registry.js';
@@ -39,9 +38,9 @@ async function main() {
 
   // Multi-user registry: seeds env admins, loads data/users.json.
   userRegistry.init();
-  logger.info(`Multi-user: max ${userRegistry.maxUsers()} members (admins from TELEGRAM_ALLOWED_USERS)`);
+  logger.info(`Multi-user: every /start member gets their own wallet (max ${userRegistry.maxUsers()} members)`);
   logger.info(
-    `Wallet: ${walletInfo.address} (${walletInfo.source === 'env' ? 'from .env' : walletInfo.source === 'file' ? 'from data/wallet.json' : 'auto-generated'})`
+    `Legacy env wallet: ${walletInfo.address} (${walletInfo.source}) — per-user wallets are created on /start`
   );
 
   // Validate required env
@@ -54,36 +53,11 @@ async function main() {
     logger.warn('⚠️  PREDICTFUN_API_KEY is not set. Market data may be limited.');
   }
 
-  if (!config.predictfun.privateKey) {
-    logger.warn('⚠️  PREDICTFUN_PRIVATE_KEY is not set. Only view-only mode available.');
-  } else {
-    // Pre-initialize signer
-    await predictSigner.init().catch((e) => {
-      logger.warn({ err: e }, 'Signer init failed — will retry on first trade');
-    });
-
-    // Live mode needs on-chain approvals before the first order can fill.
-    if (!config.trading.dryRun) {
-      const approvals = await predictSigner.ensureApprovals();
-      if (!approvals.success) {
-        logger.error(
-          { reason: approvals.error },
-          'Protocol approvals are NOT ready — live orders will fail until this is fixed'
-        );
-      }
-    }
-  }
+  // Note: PREDICTFUN_PRIVATE_KEY is now legacy — user accounts create their
+  // own wallets, and per-user approvals run lazily on the first order.
 
   // Create Telegram bot
   const bot = createBot();
-
-  // Access requests → ping every active admin (works from any handler).
-  userRegistry.setNotifier(async (text: string) => {
-    for (const adminId of userRegistry.activeIds()) {
-      if (!userRegistry.isAdmin(adminId)) continue;
-      await bot.api.sendMessage(adminId, text, { parse_mode: 'HTML' }).catch(() => {});
-    }
-  });
 
   // Set bot commands menu
   await bot.api.setMyCommands([
@@ -96,8 +70,8 @@ async function main() {
     { command: 'history', description: '📜 Last 10 trades' },
     { command: 'trend', description: '📈 Orderbook / trend' },
     { command: 'reset', description: '🔄 Reset circuit breaker' },
-    { command: 'export', description: '🔑 Export wallet private key (owner only)' },
-    { command: 'users', description: '👥 Member list + approvals (admin)' },
+    { command: 'export', description: '🔑 Export YOUR wallet private key' },
+    { command: 'users', description: '👥 Member list (admin)' },
     { command: 'help', description: '❓ Show help' },
   ]);
 
@@ -110,27 +84,9 @@ async function main() {
   // Watch wallet balances and announce incoming deposits
   startDepositWatcher(bot);
 
-  // Register approved members for push notifications
+  // Register members for push notifications
   for (const userId of userRegistry.activeIds()) {
     registerNotifyTarget(userId);
-  }
-
-  // Freshly auto-generated wallet: tell the owner where to send funds.
-  if (walletInfo.generated && config.telegram.allowedUsers.length > 0) {
-    const msg = [
-      `🆕 <b>New trading wallet created & saved!</b>`,
-      ``,
-      `Address: <code>${walletInfo.address}</code>`,
-      ``,
-      `1️⃣ Is address par <b>USDT (BEP-20)</b> + thoda <b>BNB</b> (gas) transfer karo.`,
-      `2️⃣ Phir ⚡ Quick Bet se trading shuru.`,
-      ``,
-      `🔑 Key export: <b>/export</b>`,
-      `💾 Key file (server par): <code>${walletInfo.file}</code> — private rakho!`,
-    ].join('\n');
-    for (const userId of userRegistry.activeIds()) {
-      await bot.api.sendMessage(userId, msg, { parse_mode: 'HTML' }).catch(() => {});
-    }
   }
 
   // Graceful shutdown

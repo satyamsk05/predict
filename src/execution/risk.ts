@@ -178,17 +178,30 @@ class RiskManager {
    *
    * @returns true when at least one matching open trade was settled.
    */
-  public recordSettlement(marketId: string, pnlUsd: number, outcome?: string): boolean {
+  public recordSettlement(
+    marketId: string,
+    pnlUsd: number,
+    outcome?: string,
+    /** Attribute only this member's trades (per-user wallets). */
+    userId?: number
+  ): boolean {
     if (!Number.isFinite(pnlUsd)) return false;
 
-    const key = `${marketId}|${outcome || ''}`;
+    // Key must be per-user: two members can bet on the same market+outcome.
+    const key = `${marketId}|${outcome || ''}|${userId ?? 'x'}`;
     if (this.settledKeys.has(key)) return false;
 
     let matches = this.tradeHistory.filter(
-      (t) => t.marketId === marketId && !t.settled && (!outcome || t.outcome === outcome)
+      (t) =>
+        t.marketId === marketId &&
+        !t.settled &&
+        (!outcome || t.outcome === outcome) &&
+        (!userId || t.userId === userId)
     );
     if (matches.length === 0) {
-      matches = this.tradeHistory.filter((t) => t.marketId === marketId && !t.settled);
+      matches = this.tradeHistory.filter(
+        (t) => t.marketId === marketId && !t.settled && (!userId || t.userId === userId)
+      );
     }
     if (matches.length === 0) return false;
 

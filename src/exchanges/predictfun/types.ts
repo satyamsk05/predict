@@ -1,3 +1,18 @@
+export type TradeSide = 'UP' | 'DOWN';
+
+/**
+ * Map an API outcome name ("Up"/"Yes"/"Down"/"No") to our UP/DOWN sides.
+ * Single source of truth: handlers, settlement and reconciliation must all
+ * classify outcomes the same way or trades settle on the wrong side.
+ */
+export function sideOfOutcome(name?: string | null): TradeSide | null {
+  const n = (name || '').trim().toLowerCase();
+  if (!n) return null;
+  if (n.includes('up') || n.includes('yes')) return 'UP';
+  if (n.includes('down') || n.includes('no')) return 'DOWN';
+  return null;
+}
+
 export interface PredictBookLevel {
   price: number;
   size: number;

@@ -2,19 +2,25 @@ import { OrderBuilder, ChainId, Side } from '@predictdotfun/sdk';
 import { ethers } from 'ethers';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
-import { predictFunApi } from './api.js';
-import { outcomeBuyPrice, type PredictMarket } from './types.js';
+import { predictFunApi, type PredictFunApi } from './api.js';
+import { outcomeBuyPrice, sideOfOutcome, type PredictMarket } from './types.js';
 
 class PredictSigner {
   private orderBuilder: OrderBuilder | null = null;
   private isInitialized: boolean = false;
   /** Approval state is per market type (standard vs neg-risk), so cache by key. */
   private approvalsReady: Set<string> = new Set();
+  /** API instance whose wallet signs orders (global default / per-user in multi-user mode). */
+  private api: PredictFunApi;
+
+  constructor(api: PredictFunApi = predictFunApi) {
+    this.api = api;
+  }
 
   public async init(): Promise<void> {
     if (this.isInitialized && this.orderBuilder) return;
 
-    const wallet = predictFunApi.getWallet();
+    const wallet = this.api.getWallet();
     if (!wallet) {
       logger.warn('Signer wallet not available; dry-run or view-only mode.');
       return;
@@ -22,17 +28,15 @@ class PredictSigner {
 
     try {
       const chainId = config.predictfun.isTestnet ? ChainId.BnbTestnet : ChainId.BnbMainnet;
-      const options = config.predictfun.predictAccount
-        ? { predictAccount: config.predictfun.predictAccount }
-        : undefined;
+      // Use this instance's Predict Account (per-user runtimes are EOA-only).
+      const predictAccount = this.api.getPredictAccount();
+      const options = predictAccount ? { predictAccount } : undefined;
       this.orderBuilder = await OrderBuilder.make(chainId, wallet, options as any);
       this.isInitialized = true;
       logger.info(
         'OrderBuilder initialized successfully with wallet ' +
           wallet.address +
-          (config.predictfun.predictAccount
-            ? ` (predictAccount ${config.predictfun.predictAccount})`
-            : '')
+          (predictAccount ? ` (predictAccount ${predictAccount})` : '')
       );
     } catch (e) {
       logger.error({ err: e }, 'Failed to initialize OrderBuilder');
@@ -162,12 +166,9 @@ class PredictSigner {
         return { success: false, error: `Approvals failed: ${approvals.error}` };
       }
 
-      const targetOutcome = market.outcomes.find(
-        (o) =>
-          o.name.toUpperCase().includes(outcome) ||
-          (outcome === 'UP' && (o.name.toLowerCase() === 'yes' || o.indexSet === 1)) ||
-          (outcome === 'DOWN' && (o.name.toLowerCase() === 'no' || o.indexSet === 2))
-      );
+      const targetOutcome =
+        market.outcomes.find((o) => sideOfOutcome(o.name) === outcome) ||
+        market.outcomes.find((o) => o.indexSet === (outcome === 'UP' ? 1 : 2));
 
       if (!targetOutcome || (!targetOutcome.onChainId && !targetOutcome.tokenId)) {
         return {
@@ -223,7 +224,9 @@ class PredictSigner {
         quantityWei,
       });
 
-      const feeRateBps = market.feeRateBps != null ? BigInt(market.feeRateBps) : 0n;
+      // BigInt() throws on decimals ("100.5") — round defensively.
+      const feeBpsNum = Number(market.feeRateBps ?? 0);
+      const feeRateBps = Number.isFinite(feeBpsNum) && feeBpsNum > 0 ? BigInt(Math.round(feeBpsNum)) : 0n;
       const order = this.orderBuilder.buildOrder('LIMIT', {
         side,
         tokenId,
@@ -251,7 +254,7 @@ class PredictSigner {
         },
       };
 
-      const result = await predictFunApi.postOrder(payload);
+      const result = await this.api.postOrder(payload);
       return result;
     } catch (error: any) {
       logger.error(
@@ -310,4 +313,5 @@ class PredictSigner {
   }
 }
 
+export { PredictSigner };
 export const predictSigner = new PredictSigner();

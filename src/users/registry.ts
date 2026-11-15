@@ -67,22 +67,14 @@ function userFile(): string {
   return path.join(userDir(), 'users.json');
 }
 
-type AdminNotifier = (text: string) => Promise<void>;
-
 class UserRegistry {
   private users: UserRecord[] = [];
-  private adminNotifier: AdminNotifier | null = null;
 
   /** Called once at startup (before the bot starts polling). */
   public init() {
     this.load();
     this.seedAdmins();
     this.save();
-  }
-
-  /** Wire a notifier so access requests can ping admins from Telegram. */
-  public setNotifier(fn: AdminNotifier) {
-    this.adminNotifier = fn;
   }
 
   private load() {
@@ -165,54 +157,37 @@ class UserRegistry {
     return this.users.filter((u) => u.role === 'user').length; // pending + active
   }
 
-  // ─── Access request / approval flow ─────────────────────────
+  // ─── Access flow (NO approval — /start creates the account directly) ───
 
-  /** @returns 'active' | 'pending' | 'full' (and notifies admins on a NEW request). */
-  public async requestAccess(
-    telegramId: number,
-    username?: string
-  ): Promise<'active' | 'pending' | 'full'> {
+  /**
+   * Auto-create an active member. @returns 'active' | 'full' (slots capped).
+   */
+  public ensureUser(telegramId: number, username?: string): 'active' | 'full' {
     const existing = this.get(telegramId);
-    if (existing?.status === 'active') return 'active';
-    if (existing?.status === 'pending') return 'pending';
+    if (existing) {
+      if (existing.status !== 'active') {
+        existing.status = 'active';
+        this.save();
+      }
+      if (username && existing.username !== username) {
+        existing.username = username;
+        this.save();
+      }
+      return 'active';
+    }
     if (this.memberCount() >= MAX_USERS) return 'full';
 
     this.users.push({
       telegramId,
       username,
       role: 'user',
-      status: 'pending',
+      status: 'active',
       createdAt: new Date().toISOString(),
       stats: emptyStats(),
     });
     this.save();
-    logger.info({ telegramId, username }, 'Access request filed — waiting for admin approval');
-
-    if (this.adminNotifier) {
-      const uname = username ? `@${username}` : `id ${telegramId}`;
-      await this.adminNotifier(
-        [
-          `🆕 <b>Access Request</b>`,
-          ``,
-          `User: <b>${uname}</b> (<code>${telegramId}</code>)`,
-          `Members: ${this.memberCount()}/${MAX_USERS}`,
-          ``,
-          `Approve karo: <code>/approve ${telegramId}</code>`,
-          `Reject karo: <code>/kick ${telegramId}</code>`,
-        ].join('\n')
-      ).catch(() => {});
-    }
-    return 'pending';
-  }
-
-  /** @returns the approved user, or null when there was nothing to approve. */
-  public approve(telegramId: number): UserRecord | null {
-    const u = this.get(telegramId);
-    if (!u || u.status !== 'pending') return null;
-    u.status = 'active';
-    this.save();
-    logger.info({ telegramId }, 'User approved by admin');
-    return u;
+    logger.info({ telegramId, username }, 'New member auto-registered (no approval needed)');
+    return 'active';
   }
 
   /** Remove a member (pending or active). Admins cannot be kicked. */

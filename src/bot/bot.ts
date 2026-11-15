@@ -15,7 +15,6 @@ import {
   handleCallbackQuery,
   handleTextMessage,
   handleExport,
-  handleApprove,
   handleUsers,
   handleKick,
 } from './handlers.js';
@@ -41,8 +40,7 @@ export function createBot() {
   bot.command('orderbook', handleOrderbook);
   bot.command('reset', handleReset);
   bot.command('export', handleExport);
-  // Multi-user (max 10) management — admin-only
-  bot.command('approve', handleApprove);
+  // Multi-user management — admin-only (no approval: /start auto-creates)
   bot.command('users', handleUsers);
   bot.command('kick', handleKick);
 
