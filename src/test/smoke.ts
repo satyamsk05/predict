@@ -4,7 +4,11 @@
  */
 import assert from 'node:assert/strict';
 import { parseBetText } from '../bot/betText.js';
-import { outcomeBuyPrice, type PredictMarketOutcome } from '../exchanges/predictfun/types.js';
+import {
+  outcomeBuyPrice,
+  sideOfOutcome,
+  type PredictMarketOutcome,
+} from '../exchanges/predictfun/types.js';
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -67,6 +71,26 @@ check('does NOT fall back to best bid (unfillable buy)', () => {
 });
 check('undefined outcome → undefined', () => {
   assert.equal(outcomeBuyPrice(undefined), undefined);
+});
+
+console.log('sideOfOutcome');
+check('maps Up/Down', () => {
+  assert.equal(sideOfOutcome('Up'), 'UP');
+  assert.equal(sideOfOutcome('DOWN'), 'DOWN');
+});
+check('maps Yes/No (binary markets)', () => {
+  assert.equal(sideOfOutcome('yes'), 'UP');
+  assert.equal(sideOfOutcome('No'), 'DOWN');
+});
+check('trims and handles null/empty', () => {
+  assert.equal(sideOfOutcome('  Up  '), 'UP');
+  assert.equal(sideOfOutcome(null), null);
+  assert.equal(sideOfOutcome(''), null);
+  assert.equal(sideOfOutcome(undefined), null);
+});
+check('unknown outcome → null (never guessed)', () => {
+  assert.equal(sideOfOutcome('tie'), null);
+  assert.equal(sideOfOutcome('void'), null);
 });
 
 console.log(`\n✅ All ${passed} smoke tests passed`);

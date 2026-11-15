@@ -38,10 +38,27 @@ async function main() {
 
   // Multi-user registry: seeds env admins, loads data/users.json.
   userRegistry.init();
-  logger.info(`Multi-user: every /start member gets their own wallet (max ${userRegistry.maxUsers()} members)`);
   logger.info(
-    `Legacy env wallet: ${walletInfo.address} (${walletInfo.source}) — per-user wallets are created on /start`
+    {
+      maxUsers: userRegistry.maxUsers(),
+      userDailyLossLimitUsdt: userRegistry.userDailyLossLimit(),
+      inviteOnly: userRegistry.joinCodeRequired(),
+    },
+    'Multi-user mode: every member gets their own wallet (per-user keys, PnL and limits)'
   );
+  if (userRegistry.all().every((u) => u.role !== 'admin')) {
+    logger.warn(
+      '⚠️  No admin configured (TELEGRAM_ALLOWED_USERS / TELEGRAM_ADMIN_ID) — /users, /kick, /unban and /reset are locked to nobody.'
+    );
+  }
+
+  if (walletInfo.address) {
+    logger.info(
+      `Legacy owner wallet: ${walletInfo.address} (${walletInfo.source}) — member trading uses per-user wallets`
+    );
+  } else {
+    logger.info('No legacy owner wallet configured — using per-user wallets only');
+  }
 
   // Validate required env
   if (!config.telegram.token) {
@@ -69,8 +86,9 @@ async function main() {
     { command: 'stats', description: '📈 Win/loss stats & daily PnL' },
     { command: 'history', description: '📜 Last 10 trades' },
     { command: 'trend', description: '📈 Orderbook / trend' },
-    { command: 'reset', description: '🔄 Reset circuit breaker' },
+    { command: 'reset', description: '🔄 Reset circuit breaker (admin)' },
     { command: 'export', description: '🔑 Export YOUR wallet private key' },
+    { command: 'withdraw', description: '💸 Withdraw USDT to another wallet' },
     { command: 'users', description: '👥 Member list (admin)' },
     { command: 'help', description: '❓ Show help' },
   ]);

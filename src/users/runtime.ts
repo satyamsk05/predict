@@ -15,6 +15,7 @@ export interface UserRuntime {
 
 const runtimes = new Map<number, UserRuntime>();
 
+/** Existing runtime for a user, or null when they have no wallet yet. */
 export function getUserRuntime(telegramId: number): UserRuntime | null {
   const cached = runtimes.get(telegramId);
   if (cached) return cached;
@@ -30,6 +31,15 @@ export function getUserRuntime(telegramId: number): UserRuntime | null {
   return rt;
 }
 
+/** Create the wallet if needed, then return its runtime. */
+export function ensureUserRuntime(telegramId: number, username?: string): UserRuntime | null {
+  const cached = runtimes.get(telegramId);
+  if (cached) return cached;
+  userAccounts.ensureAccount(telegramId, username);
+  return getUserRuntime(telegramId);
+}
+
+/** Drop cached decrypted-key state (kick/ban, or after an export). */
 export function dropUserRuntime(telegramId: number) {
   runtimes.delete(telegramId);
 }

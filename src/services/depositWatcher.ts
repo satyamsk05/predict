@@ -2,15 +2,15 @@ import type { Bot, Context } from 'grammy';
 import { logger } from '../utils/logger.js';
 import { stateStore } from '../utils/store.js';
 import { portfolioUrl, addressUrl, linkLine } from '../bot/links.js';
-import { userAccounts } from '../users/accounts.js';
+import { userRegistry } from '../users/registry.js';
 import { getUserRuntime } from '../users/runtime.js';
 
 /**
- * Deposit watcher: polls the wallet's USDT / BNB balances and notifies
- * whitelisted chats when funds arrive from outside (on-chain top-up).
+ * Deposit watcher: polls each member's wallet (USDT / BNB) and notifies that
+ * member when funds arrive from outside (on-chain top-up).
  *
- * Baselines persist in state.json, so a deposit made while the bot was
- * offline is still announced on the next successful poll. Trades spend
+ * Baselines persist in state.json (`depositUsers`), so a deposit made while the
+ * bot was offline is still announced on the next successful poll. Trades spend
  * funds (balance decreases) so they never trigger a false "deposit".
  */
 
@@ -19,89 +19,113 @@ const POLL_MS = 30_000;
 const MIN_USDT_DELTA = 0.01;
 /** Minimum BNB increase that counts as a deposit (covers tiny gas top-ups). */
 const MIN_BNB_DELTA = 0.0001;
+/** RPC calls must not hang the whole poll cycle. */
+const BALANCE_TIMEOUT_MS = 20_000;
+
+type Balance = { usdt: number; bnb: number };
 
 let timer: NodeJS.Timeout | null = null;
 let started = false;
-/** Per-user baselines: telegramId → { usdt, bnb }. */
-const baselines = new Map<number, { usdt: number; bnb: number }>();
+/** telegramId → last seen balance */
+const lastBalances: Map<number, Balance> = new Map();
 
-function loadBaseline() {
-  const saved = stateStore.get().depositUsers;
-  if (!saved) return;
-  for (const [id, b] of Object.entries(saved)) {
-    if (Number.isFinite(b.usdt) && Number.isFinite(b.bnb)) {
-      baselines.set(Number(id), { usdt: b.usdt, bnb: b.bnb });
+function loadBaselines() {
+  const saved = stateStore.get().depositUsers || {};
+  for (const [id, bal] of Object.entries(saved)) {
+    const userId = Number(id);
+    if (Number.isFinite(userId) && bal && Number.isFinite(bal.usdt) && Number.isFinite(bal.bnb)) {
+      lastBalances.set(userId, { usdt: bal.usdt, bnb: bal.bnb });
     }
   }
-  if (baselines.size) {
-    logger.info({ users: baselines.size }, 'Restored deposit-watcher baselines');
+  if (lastBalances.size > 0) {
+    logger.info({ users: lastBalances.size }, 'Restored per-user deposit baselines');
   }
 }
 
-function persistBaseline() {
-  const out: Record<string, { usdt: number; bnb: number }> = {};
-  for (const [id, b] of baselines) out[String(id)] = b;
+function persistBaselines() {
+  const users: Record<string, Balance> = {};
+  for (const [id, bal] of lastBalances) users[String(id)] = bal;
   stateStore.update((s) => {
-    s.depositUsers = out;
+    s.depositUsers = users;
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('RPC timeout')), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
   });
 }
 
 async function poll(bot: Bot<Context>) {
-  // Watch every member's own wallet (per-user accounts).
-  for (const acc of userAccounts.all()) {
-    const userId = acc.telegramId;
+  let changed = false;
+
+  for (const userId of userRegistry.activeIds()) {
     const rt = getUserRuntime(userId);
-    if (!rt) continue;
+    if (!rt) continue; // no wallet yet
 
     let bal;
     try {
-      bal = await rt.api.getBalance();
+      bal = await withTimeout(rt.api.getBalance(), BALANCE_TIMEOUT_MS);
     } catch {
       continue; // RPC hiccup — keep the previous baseline
     }
     if (!bal.ok) continue;
 
-    const prev = baselines.get(userId);
-    baselines.set(userId, { usdt: bal.usdt, bnb: bal.bnb });
-    persistBaseline();
+    const prev = lastBalances.get(userId);
+    lastBalances.set(userId, { usdt: bal.usdt, bnb: bal.bnb });
+    changed = true;
 
     if (!prev) continue; // first poll = baseline only
 
     const dUsdt = bal.usdt - prev.usdt;
     const dBnb = bal.bnb - prev.bnb;
+    if (dUsdt < MIN_USDT_DELTA && dBnb < MIN_BNB_DELTA) continue;
 
-    if (dUsdt >= MIN_USDT_DELTA || dBnb >= MIN_BNB_DELTA) {
-      const lines = [
-        `💰 <b>Deposit Received!</b>`,
-        ``,
-        dUsdt >= MIN_USDT_DELTA ? `USDT: <b>+$${dUsdt.toFixed(2)}</b>` : '',
-        dBnb >= MIN_BNB_DELTA ? `BNB: <b>+${dBnb.toFixed(4)}</b>` : '',
-        ``,
-        `New balance: <b>$${bal.usdt.toFixed(2)} USDT</b> · ${bal.bnb.toFixed(4)} BNB`,
-        `Address: <code>${acc.address}</code>`,
-        linkLine(portfolioUrl(acc.address), 'Portfolio on Predict.fun'),
-        linkLine(addressUrl(acc.address), 'View on BSCScan'),
-      ]
-        .filter(Boolean)
-        .join('\n');
+    const address = rt.api.getEffectiveAddress();
+    const lines = [
+      `💰 <b>Funds Received!</b>`,
+      ``,
+      dUsdt >= MIN_USDT_DELTA ? `USDT: <b>+$${dUsdt.toFixed(2)}</b>` : '',
+      dBnb >= MIN_BNB_DELTA ? `BNB: <b>+${dBnb.toFixed(4)}</b>` : '',
+      ``,
+      `New balance: <b>$${bal.usdt.toFixed(2)} USDT</b> · ${bal.bnb.toFixed(4)} BNB`,
+      address ? `Address: <code>${address}</code>` : '',
+      linkLine(portfolioUrl(address), 'Portfolio on Predict.fun'),
+      linkLine(addressUrl(address), 'View on BSCScan'),
+      ``,
+      `ℹ️ Deposit ya Predict.fun payout — dono isi tarah dikhte hain.`,
+    ]
+      .filter(Boolean)
+      .join('\n');
 
-      await bot.api.sendMessage(userId, lines, { parse_mode: 'HTML' }).catch((e) => {
-        logger.warn({ err: e, userId }, 'Deposit notify failed');
-      });
-      logger.info({ userId, dUsdt, dBnb }, 'Deposit notification sent');
-    }
+    await bot.api.sendMessage(userId, lines, { parse_mode: 'HTML' }).catch((e) => {
+      logger.warn({ err: e, userId }, 'Deposit notify failed');
+    });
+    logger.info({ dUsdt, dBnb, userId }, 'Deposit notification sent');
   }
+
+  if (changed) persistBaselines();
 }
 
 export function startDepositWatcher(bot: Bot<Context>) {
   if (started) return;
   started = true;
-  loadBaseline();
+  loadBaselines();
   // First poll establishes the baseline, then we keep watching.
   void poll(bot).finally(() => {
     timer = setInterval(() => void poll(bot), POLL_MS);
   });
-  logger.info({ pollMs: POLL_MS }, 'Deposit watcher started');
+  logger.info({ pollMs: POLL_MS }, 'Per-user deposit watcher started');
 }
 
 export function stopDepositWatcher() {

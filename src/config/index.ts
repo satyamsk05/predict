@@ -82,9 +82,11 @@ const allowedUsersRaw = process.env.TELEGRAM_ALLOWED_USERS || '';
 const allowedUsers = allowedUsersRaw
   .split(',')
   .map((s) => parseInt(s.trim(), 10))
-  .filter((n) => !isNaN(n));
+  .filter((n) => Number.isFinite(n) && n > 0);
 
-const isTestnet = process.env.PREDICTFUN_TESTNET === 'true';
+// Use the same strict parser: `PREDICTFUN_TESTNET=1` must not silently point
+// the bot at mainnet.
+const isTestnet = parseBool(process.env.PREDICTFUN_TESTNET, false);
 
 // Wallet bootstrap: env key > data/wallet.json > auto-generate a fresh one.
 const walletBoot = resolveWallet(process.env.PREDICTFUN_PRIVATE_KEY || '');
@@ -131,11 +133,10 @@ export const config: AppConfig = {
   },
 };
 
-/** Exported so the Telegram bot can announce / export the wallet. */
+/** Exported so the Telegram bot can announce the legacy owner wallet (if any). */
 export const walletInfo = {
   address: walletBoot.address,
   source: walletBoot.source,
-  generated: walletBoot.source === 'generated',
   /** File location hint for owner messages (matches utils/store defaults). */
   file: process.env.DATA_DIR
     ? `${process.env.DATA_DIR.replace(/[\\/]+$/, '')}/wallet.json`

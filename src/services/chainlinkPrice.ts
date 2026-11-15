@@ -1,5 +1,6 @@
-import { config } from '../config/index.js';
+import { ethers } from 'ethers';
 import { logger } from '../utils/logger.js';
+import { getProvider } from '../utils/provider.js';
 
 /**
  * Chainlink BTC/USD aggregator on BNB Smart Chain.
@@ -50,8 +51,8 @@ class ChainlinkPriceService {
   private async fetchOnce() {
     try {
       if (!this.contract) {
-        const { ethers } = await import('ethers');
-        const provider = new ethers.JsonRpcProvider(config.predictfun.rpcUrl);
+        // Shared provider: one polling loop for the whole process.
+        const provider = getProvider();
         const abi = [
           'function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)',
           'function decimals() view returns (uint8)',
@@ -59,9 +60,12 @@ class ChainlinkPriceService {
         this.contract = new ethers.Contract(FEED_ADDRESS, abi, provider);
       }
 
-      const [decimals, round] = await Promise.all([
-        this.contract.decimals(),
-        this.contract.latestRoundData(),
+      // Bound the call: a hung RPC socket must not stop the poll loop forever.
+      const [decimals, round] = await Promise.race([
+        Promise.all([this.contract.decimals(), this.contract.latestRoundData()]),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Chainlink RPC timeout')), 20_000)
+        ),
       ]);
 
       const value = Number(round.answer) / 10 ** Number(decimals);

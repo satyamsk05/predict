@@ -17,6 +17,8 @@ import {
   handleExport,
   handleUsers,
   handleKick,
+  handleUnban,
+  handleWithdraw,
 } from './handlers.js';
 
 export function createBot() {
@@ -40,9 +42,11 @@ export function createBot() {
   bot.command('orderbook', handleOrderbook);
   bot.command('reset', handleReset);
   bot.command('export', handleExport);
+  bot.command('withdraw', handleWithdraw);
   // Multi-user management — admin-only (no approval: /start auto-creates)
   bot.command('users', handleUsers);
   bot.command('kick', handleKick);
+  bot.command('unban', handleUnban);
 
   // Legacy inline callbacks (show tip to use reply keyboard)
   bot.on('callback_query:data', handleCallbackQuery);

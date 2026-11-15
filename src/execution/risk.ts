@@ -2,6 +2,7 @@ import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 import { stateStore } from '../utils/store.js';
 import { userRegistry } from '../users/registry.js';
+import { sideOfOutcome } from '../exchanges/predictfun/types.js';
 
 export interface TradeRecord {
   timestamp: number;
@@ -187,21 +188,27 @@ class RiskManager {
   ): boolean {
     if (!Number.isFinite(pnlUsd)) return false;
 
+    // API outcomes are "Up"/"Yes" while trades store "UP"/"DOWN". Normalise
+    // before comparing, otherwise every settlement falls through to the
+    // less precise market-only fallback below.
+    const settledOutcome = sideOfOutcome(outcome) || undefined;
+
     // Key must be per-user: two members can bet on the same market+outcome.
-    const key = `${marketId}|${outcome || ''}|${userId ?? 'x'}`;
+    const key = `${userId ?? 'x'}|${marketId}|${settledOutcome || ''}`;
     if (this.settledKeys.has(key)) return false;
 
+    const isOpenLive = (t: TradeRecord) =>
+      t.marketId === marketId &&
+      !t.settled &&
+      // Never let the live settler touch simulated trades (or vice versa).
+      t.dryRun !== true &&
+      (!userId || t.userId === userId);
+
     let matches = this.tradeHistory.filter(
-      (t) =>
-        t.marketId === marketId &&
-        !t.settled &&
-        (!outcome || t.outcome === outcome) &&
-        (!userId || t.userId === userId)
+      (t) => isOpenLive(t) && (!settledOutcome || t.outcome === settledOutcome)
     );
     if (matches.length === 0) {
-      matches = this.tradeHistory.filter(
-        (t) => t.marketId === marketId && !t.settled && (!userId || t.userId === userId)
-      );
+      matches = this.tradeHistory.filter(isOpenLive);
     }
     if (matches.length === 0) return false;
 
@@ -233,10 +240,17 @@ class RiskManager {
    * open position for market+outcome appears in the API.
    * @returns how many trades were marked filled.
    */
-  public markFilled(marketId: string, outcome: 'UP' | 'DOWN'): number {
+  public markFilled(marketId: string, outcome: 'UP' | 'DOWN', userId?: number): number {
     let marked = 0;
     for (const t of this.tradeHistory) {
-      if (t.marketId === marketId && t.outcome === outcome && !t.settled && t.filled === false) {
+      if (
+        t.marketId === marketId &&
+        t.outcome === outcome &&
+        !t.settled &&
+        t.filled === false &&
+        t.dryRun !== true &&
+        (userId == null || t.userId === userId)
+      ) {
         t.filled = true;
         marked++;
       }
@@ -263,6 +277,10 @@ class RiskManager {
         ? -trade.amountUsdt
         : 0;
 
+    // Per-member stats must update in DRY RUN too (previously only live
+    // settlements reached userRegistry.recordPnl, so member stats stayed 0).
+    userRegistry.recordPnl(trade.userId, trade.pnlUsd);
+
     if (trade.pnlUsd < 0) {
       this.dailyLossUsd += Math.abs(trade.pnlUsd);
       if (this.dailyLossUsd >= config.trading.dailyLossLimitUsdt) {
@@ -275,31 +293,45 @@ class RiskManager {
   }
 
   /** Unsettled trades placed in dry-run mode (input for the dry-run settler). */
-  public getUnsettledDryRunTrades(): TradeRecord[] {
-    return this.tradeHistory.filter((t) => !t.settled && t.dryRun === true);
+  public getUnsettledDryRunTrades(userId?: number): TradeRecord[] {
+    return this.tradeHistory.filter(
+      (t) => !t.settled && t.dryRun === true && (userId == null || t.userId === userId)
+    );
   }
 
   /** True when a live order was placed but not yet confirmed filled. */
-  public hasUnfilledTrades(): boolean {
-    return this.tradeHistory.some((t) => !t.settled && t.filled === false);
+  public hasUnfilledTrades(userId?: number): boolean {
+    return this.tradeHistory.some(
+      (t) =>
+        !t.settled &&
+        t.filled === false &&
+        t.dryRun !== true &&
+        (userId == null || t.userId === userId)
+    );
   }
 
-  public getOpenTrades(): TradeRecord[] {
-    return this.tradeHistory.filter((t) => !t.settled);
+  public getOpenTrades(userId?: number): TradeRecord[] {
+    return this.tradeHistory.filter(
+      (t) => !t.settled && (userId == null || t.userId === userId)
+    );
   }
 
-  public getStats() {
-    const totalTrades = this.tradeHistory.length;
-    const settledTrades = this.tradeHistory.filter((t) => t.settled);
+  public getStats(userId?: number) {
+    const trades =
+      userId == null ? this.tradeHistory : this.tradeHistory.filter((t) => t.userId === userId);
+    const totalTrades = trades.length;
+    const settledTrades = trades.filter((t) => t.settled);
     const winningTrades = settledTrades.filter((t) => (t.pnlUsd || 0) > 0);
-    const winRate = settledTrades.length > 0 ? (winningTrades.length / settledTrades.length) * 100 : 0;
+    const winRate =
+      settledTrades.length > 0 ? (winningTrades.length / settledTrades.length) * 100 : 0;
     const totalPnl = settledTrades.reduce((acc, t) => acc + (t.pnlUsd || 0), 0);
+    const member = userId != null ? userRegistry.getStats(userId) : null;
 
     return {
       isTripped: this.isTripped,
       tripReason: this.tripReason,
-      dailyTrades: this.dailyTradesCount,
-      dailyLoss: this.dailyLossUsd,
+      dailyTrades: member ? member.dailyTrades : this.dailyTradesCount,
+      dailyLoss: member ? member.dailyLossUsd : this.dailyLossUsd,
       totalTrades,
       winRate: winRate.toFixed(1),
       totalPnl: totalPnl.toFixed(2),
@@ -307,15 +339,22 @@ class RiskManager {
     };
   }
 
-  public getRecentTrades(): TradeRecord[] {
-    return [...this.tradeHistory].reverse().slice(0, 10);
+  public getRecentTrades(userId?: number, limit = 10): TradeRecord[] {
+    const list =
+      userId == null ? this.tradeHistory : this.tradeHistory.filter((t) => t.userId === userId);
+    return [...list].reverse().slice(0, limit);
   }
 
   /** Total USDT currently staked in unresolved FILLED trades (informational).
    *  Unfilled limit orders commit no funds, so they are excluded. */
-  public getOpenExposureUsdt(): number {
+  public getOpenExposureUsdt(userId?: number): number {
     return this.tradeHistory
-      .filter((t) => !t.settled && t.filled !== false)
+      .filter(
+        (t) =>
+          !t.settled &&
+          t.filled !== false &&
+          (userId == null || t.userId === userId)
+      )
       .reduce((sum, t) => sum + t.amountUsdt, 0);
   }
 }

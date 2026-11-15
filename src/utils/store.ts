@@ -22,7 +22,7 @@ export interface PersistedAutoState {
   notifyTargets: Array<{ chatId: number; paused: boolean }>;
 }
 
-/** Last-seen wallet balances, used to detect incoming deposits. */
+/** Legacy single-wallet baseline (kept so old state.json files still parse). */
 export interface PersistedDepositState {
   usdt: number;
   bnb: number;
@@ -183,7 +183,22 @@ class StateStore {
       fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
       const tmp = `${this.file}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-      fs.renameSync(tmp, this.file);
+      try {
+        fs.renameSync(tmp, this.file);
+      } catch (e) {
+        // Windows can refuse to replace an existing file.
+        try {
+          fs.unlinkSync(this.file);
+          fs.renameSync(tmp, this.file);
+        } catch {
+          try {
+            fs.unlinkSync(tmp);
+          } catch {
+            // ignore
+          }
+          throw e;
+        }
+      }
     } catch (e) {
       logger.warn({ err: e, file: this.file }, 'Failed to persist bot state');
     }

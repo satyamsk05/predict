@@ -181,16 +181,20 @@ function decrypt(enc: EncKey, telegramId: number): string {
   const tag = Buffer.from(enc.tag, 'hex');
   const data = Buffer.from(enc.data, 'hex');
 
+  // Version 2 binds the ciphertext to this Telegram id. Legacy blobs (no
+  // version field) were written without AAD, so try both.
+  const aadModes = enc.v === ENC_VERSION ? [true, false] : [false];
   let lastError: unknown;
   for (const key of all) {
-    try {
-      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-      // Version 2 binds the ciphertext to this Telegram id.
-      if (enc.v !== 1) decipher.setAAD(aad(telegramId));
-      decipher.setAuthTag(tag);
-      return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
-    } catch (e) {
-      lastError = e;
+    for (const withAad of aadModes) {
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        if (withAad) decipher.setAAD(aad(telegramId));
+        decipher.setAuthTag(tag);
+        return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+      } catch (e) {
+        lastError = e;
+      }
     }
   }
   throw lastError instanceof Error ? lastError : new Error('Could not decrypt wallet key');

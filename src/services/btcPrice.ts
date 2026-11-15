@@ -93,11 +93,16 @@ class BtcPriceService {
     // If WS hasn't received update in 10s, fetch via REST
     if (Date.now() - this.lastUpdated > 10000 || this.price === 0) {
       try {
-        const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+        const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', {
+          signal: AbortSignal.timeout(10_000),
+        });
         if (res.ok) {
           const data = (await res.json()) as { price: string };
-          this.price = parseFloat(data.price);
-          this.lastUpdated = Date.now();
+          const price = parseFloat(data.price);
+          if (Number.isFinite(price) && price > 0) {
+            this.price = price;
+            this.lastUpdated = Date.now();
+          }
         }
       } catch {
         // quiet error
@@ -106,6 +111,10 @@ class BtcPriceService {
   }
 
   public getPrice(): number {
+    if (this.price <= 0) return 0;
+    // Never present a stale print as a live price — 5m rounds move fast and a
+    // frozen feed would silently mis-score the trend / lock price.
+    if (this.lastUpdated > 0 && Date.now() - this.lastUpdated > 60_000) return 0;
     return this.price;
   }
 

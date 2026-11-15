@@ -4,22 +4,35 @@ import { config } from '../config/index.js';
 import { logger } from '../utils/logger.js';
 
 /**
- * Small multi-user registry ("club mode", max 10 members).
+ * Multi-user registry (max 10 members by default).
  *
  * - Admins come from TELEGRAM_ALLOWED_USERS (+ optional TELEGRAM_ADMIN_ID).
- * - Strangers who /start the bot file an access request (pending).
- * - An admin approves with /approve <id> — up to MAX_USERS members.
+ * - New members are auto-registered on /start (no approval step).
+ * - Optional JOIN_CODE makes /start invite-only, so strangers cannot fill all
+ *   slots with throwaway Telegram accounts.
+ * - /kick marks a member as blocked instead of deleting the record, otherwise
+ *   the next message from that user would simply re-register them.
  * - Every member gets per-user stats and a per-user daily loss limit.
- * - The trading wallet stays shared (10 trusted users), so /export remains
- *   admin-only.
+ * - Each member has their own wallet (see users/accounts.ts).
  */
 
-const MAX_USERS = Math.max(1, Number(process.env.MAX_USERS) || 10);
-/** Per-member daily loss cap; falls back to the global limit. */
-const USER_DAILY_LOSS_LIMIT_USDT =
-  Number(process.env.USER_DAILY_LOSS_LIMIT_USDT) || config.trading.dailyLossLimitUsdt;
+function parsePositiveInt(value: string | undefined, fallback: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(max, Math.floor(n));
+}
 
-export type UserStatus = 'active' | 'pending';
+const MAX_USERS = parsePositiveInt(process.env.MAX_USERS, 10, 10_000);
+/** Per-member daily loss cap; falls back to the global limit. */
+const USER_DAILY_LOSS_LIMIT_USDT = (() => {
+  const n = Number(process.env.USER_DAILY_LOSS_LIMIT_USDT);
+  return Number.isFinite(n) && n >= 0 ? n : config.trading.dailyLossLimitUsdt;
+})();
+
+/** Empty string = open join; any other value requires `/start <code>`. */
+const JOIN_CODE = config.telegram.joinCode;
+
+export type UserStatus = 'active' | 'pending' | 'blocked';
 
 export interface UserStats {
   trades: number;
@@ -40,6 +53,8 @@ export interface UserRecord {
   stats: UserStats;
 }
 
+export type AccessResult = 'active' | 'full' | 'blocked' | 'denied';
+
 interface UsersFile {
   version: number;
   users: UserRecord[];
@@ -57,6 +72,24 @@ function emptyStats(): UserStats {
   };
 }
 
+function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function sanitizeStats(raw: any): UserStats {
+  const base = emptyStats();
+  if (!raw || typeof raw !== 'object') return base;
+  return {
+    trades: Math.max(0, Math.floor(finiteOr(raw.trades, 0))),
+    wins: Math.max(0, Math.floor(finiteOr(raw.wins, 0))),
+    losses: Math.max(0, Math.floor(finiteOr(raw.losses, 0))),
+    pnlUsd: finiteOr(raw.pnlUsd, 0),
+    dailyLossUsd: Math.max(0, finiteOr(raw.dailyLossUsd, 0)),
+    dailyTrades: Math.max(0, Math.floor(finiteOr(raw.dailyTrades, 0))),
+    lastDay: Math.floor(finiteOr(raw.lastDay, base.lastDay)),
+  };
+}
+
 function userDir(): string {
   return process.env.DATA_DIR
     ? path.resolve(process.env.DATA_DIR)
@@ -65,6 +98,27 @@ function userDir(): string {
 
 function userFile(): string {
   return path.join(userDir(), 'users.json');
+}
+
+function writeFileAtomic(file: string, contents: string, mode = 0o600) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, contents, { mode });
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try {
+      fs.unlinkSync(file);
+      fs.renameSync(tmp, file);
+    } catch {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // ignore
+      }
+      throw e;
+    }
+  }
 }
 
 class UserRegistry {
@@ -82,9 +136,21 @@ class UserRegistry {
       if (fs.existsSync(userFile())) {
         const raw: UsersFile = JSON.parse(fs.readFileSync(userFile(), 'utf8'));
         if (Array.isArray(raw.users)) {
-          this.users = raw.users.filter(
-            (u) => Number.isFinite(u.telegramId) && (u.role === 'admin' || u.role === 'user')
-          );
+          this.users = raw.users
+            .filter(
+              (u) =>
+                u &&
+                Number.isFinite(u.telegramId) &&
+                (u.role === 'admin' || u.role === 'user')
+            )
+            .map((u) => ({
+              ...u,
+              status:
+                u.status === 'blocked' || u.status === 'pending' || u.status === 'active'
+                  ? u.status
+                  : 'active',
+              stats: sanitizeStats(u.stats),
+            }));
           logger.info({ file: userFile(), users: this.users.length }, 'Loaded user registry');
         }
       }
@@ -96,9 +162,8 @@ class UserRegistry {
 
   private save() {
     try {
-      fs.mkdirSync(userDir(), { recursive: true, mode: 0o700 });
-      const payload: UsersFile = { version: 1, users: this.users };
-      fs.writeFileSync(userFile(), JSON.stringify(payload, null, 2), { mode: 0o600 });
+      const payload: UsersFile = { version: 2, users: this.users };
+      writeFileAtomic(userFile(), JSON.stringify(payload, null, 2));
     } catch (e) {
       logger.warn({ err: e, file: userFile() }, 'Failed to persist user registry');
     }
@@ -132,12 +197,18 @@ class UserRegistry {
   // ─── Lookups ────────────────────────────────────────────────
 
   public isAdmin(id: number): boolean {
-    return this.users.some((u) => u.telegramId === id && u.role === 'admin' && u.status === 'active');
+    return this.users.some(
+      (u) => u.telegramId === id && u.role === 'admin' && u.status === 'active'
+    );
   }
 
   /** Approved (can use trading commands) — admins always count. */
   public hasAccess(id: number): boolean {
     return this.users.some((u) => u.telegramId === id && u.status === 'active');
+  }
+
+  public isBlocked(id: number): boolean {
+    return this.users.some((u) => u.telegramId === id && u.status === 'blocked');
   }
 
   public get(id: number): UserRecord | undefined {
@@ -154,27 +225,41 @@ class UserRegistry {
   }
 
   private memberCount(): number {
-    return this.users.filter((u) => u.role === 'user').length; // pending + active
+    // Blocked members no longer occupy a slot; pending/active do.
+    return this.users.filter((u) => u.role === 'user' && u.status !== 'blocked').length;
   }
 
-  // ─── Access flow (NO approval — /start creates the account directly) ───
+  // ─── Access flow (no approval — /start creates the account directly) ───
 
   /**
-   * Auto-create an active member. @returns 'active' | 'full' (slots capped).
+   * Auto-create an active member.
+   * @param joinCode value typed after `/start` (required only when JOIN_CODE set)
+   * @returns 'active' | 'full' | 'blocked' | 'denied'
    */
-  public ensureUser(telegramId: number, username?: string): 'active' | 'full' {
+  public ensureUser(
+    telegramId: number,
+    username?: string,
+    joinCode?: string
+  ): AccessResult {
     const existing = this.get(telegramId);
     if (existing) {
+      if (existing.status === 'blocked') return 'blocked';
+      let changed = false;
       if (existing.status !== 'active') {
         existing.status = 'active';
-        this.save();
+        changed = true;
       }
       if (username && existing.username !== username) {
         existing.username = username;
-        this.save();
+        changed = true;
       }
+      if (changed) this.save();
       return 'active';
     }
+
+    // New member: invite code (when configured) is checked *before* creating a
+    // record, so a wrong/absent code cannot fill a slot.
+    if (JOIN_CODE && joinCode !== JOIN_CODE) return 'denied';
     if (this.memberCount() >= MAX_USERS) return 'full';
 
     this.users.push({
@@ -186,18 +271,33 @@ class UserRegistry {
       stats: emptyStats(),
     });
     this.save();
-    logger.info({ telegramId, username }, 'New member auto-registered (no approval needed)');
+    logger.info({ telegramId, username }, 'New member auto-registered');
     return 'active';
   }
 
-  /** Remove a member (pending or active). Admins cannot be kicked. */
+  /** Block a member (keeps their stats and wallet record for auditing). */
   public kick(telegramId: number): 'admin' | 'ok' | 'notfound' {
     const u = this.get(telegramId);
     if (!u) return 'notfound';
     if (u.role === 'admin') return 'admin';
-    this.users = this.users.filter((x) => x.telegramId !== telegramId);
+    if (u.status !== 'blocked') {
+      u.status = 'blocked';
+      this.save();
+      logger.info({ telegramId }, 'User blocked by admin');
+    }
+    return 'ok';
+  }
+
+  /** Restore access for a blocked member. */
+  public unban(telegramId: number): 'admin' | 'ok' | 'notfound' | 'notblocked' {
+    const u = this.get(telegramId);
+    if (!u) return 'notfound';
+    if (u.role === 'admin') return 'admin';
+    if (u.status !== 'blocked') return 'notblocked';
+    if (this.memberCount() >= MAX_USERS) return 'notfound';
+    u.status = 'active';
     this.save();
-    logger.info({ telegramId }, 'User removed by admin');
+    logger.info({ telegramId }, 'User unbanned by admin');
     return 'ok';
   }
 
@@ -217,7 +317,8 @@ class UserRegistry {
     const u = this.get(telegramId);
     if (!u || u.status !== 'active') return { allowed: false, reason: 'Not an approved member' };
     this.rolloverIfNeeded(u);
-    if (u.stats.dailyLossUsd >= USER_DAILY_LOSS_LIMIT_USDT) {
+    // 0 (or negative) explicitly disables the personal cap.
+    if (USER_DAILY_LOSS_LIMIT_USDT > 0 && u.stats.dailyLossUsd >= USER_DAILY_LOSS_LIMIT_USDT) {
       return {
         allowed: false,
         reason: `Aaj ka personal loss limit hit ho gaya ($${u.stats.dailyLossUsd.toFixed(2)} / $${USER_DAILY_LOSS_LIMIT_USDT}). Kal phir try karna.`,
@@ -242,8 +343,9 @@ class UserRegistry {
     if (!u) return;
     this.rolloverIfNeeded(u);
     u.stats.pnlUsd += pnlUsd;
-    if (pnlUsd >= 0) u.stats.wins++;
-    else {
+    // A $0.00 refund/tie is neither a win nor a loss.
+    if (pnlUsd > 0) u.stats.wins++;
+    else if (pnlUsd < 0) {
       u.stats.losses++;
       u.stats.dailyLossUsd += Math.abs(pnlUsd);
     }
@@ -259,6 +361,14 @@ class UserRegistry {
 
   public maxUsers(): number {
     return MAX_USERS;
+  }
+
+  public userDailyLossLimit(): number {
+    return USER_DAILY_LOSS_LIMIT_USDT;
+  }
+
+  public joinCodeRequired(): boolean {
+    return JOIN_CODE.length > 0;
   }
 }
 
