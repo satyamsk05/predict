@@ -17,6 +17,10 @@ export const BTN = {
   RESUME: '🔔 Unmute alerts',
   SETTINGS: '⚙️ Settings',
 
+  EXPORT_KEY: '🔐 Export Key',
+  WITHDRAW: '💸 Withdraw',
+  HELP: '❓ Help',
+
   UP: '🟢 UP',
   DOWN: '🔴 DOWN',
   A5: '$5',
@@ -54,6 +58,14 @@ export const BET_FLOW_BTN_SET = new Set<string>([
   BTN.CUSTOM,
   BTN.CONFIRM,
   BTN.CANCEL,
+  BTN.BACK,
+]);
+
+/** Buttons used inside the Settings screen. */
+export const SETTINGS_BTN_SET = new Set<string>([
+  BTN.EXPORT_KEY,
+  BTN.WITHDRAW,
+  BTN.HELP,
   BTN.BACK,
 ]);
 
@@ -202,6 +214,18 @@ export function buildConfirmKeyboard(): Keyboard {
   return new Keyboard()
     .text(BTN.CONFIRM)
     .text(BTN.CANCEL)
+    .resized()
+    .persistent();
+}
+
+/** Settings actions live in the reply keyboard, like the Quick bet flow. */
+export function buildSettingsKeyboard(): Keyboard {
+  return new Keyboard()
+    .text(BTN.EXPORT_KEY)
+    .text(BTN.WITHDRAW)
+    .row()
+    .text(BTN.HELP)
+    .text(BTN.BACK)
     .resized()
     .persistent();
 }

@@ -12,6 +12,7 @@ import {
   BTN,
   MAIN_BTN_SET,
   BET_FLOW_BTN_SET,
+  SETTINGS_BTN_SET,
   LEGACY_BTN,
   esc,
   buildRoundCard,
@@ -21,7 +22,7 @@ import {
   buildSideKeyboard,
   buildAmountKeyboard,
   buildConfirmKeyboard,
-  buildSettingsInline,
+  buildSettingsKeyboard,
   buildPositionsInline,
   buildPositionActionsInline,
   buildPositionBackInline,
@@ -490,16 +491,19 @@ export async function handleSettings(ctx: Context) {
       ? `Wallet\n<code>${esc(address)}</code>`
       : 'Wallet not created yet — send /start.',
     '',
-    '🔐 <b>Export private key</b> — back up this wallet or import it into MetaMask / Rabby / Trust Wallet.',
+    '🔐 <b>Export Key</b> — back up this wallet or import it into MetaMask / Rabby / Trust Wallet.',
     '💸 <b>Withdraw</b> — send USDT (BEP-20) to another address.',
     '❓ <b>Help</b> — all commands and how the bot works.',
     '',
     '<i>The private key is shown in private chat only and the message deletes itself.</i>',
+    `<i>Tap a button below, or ‹ Back for the main menu.</i>`,
   ].join('\n');
 
+  // Settings actions live in the keyboard itself, like the Quick bet flow.
+  forgetMainMenu(ctx);
   await ctx.reply(text, {
     parse_mode: 'HTML',
-    reply_markup: buildSettingsInline(),
+    reply_markup: buildSettingsKeyboard(),
     link_preview_options: { is_disabled: true },
   });
 }
@@ -1782,7 +1786,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   // "Live" or "$5" was parsed as a wallet address and the user got stuck until
   // typing "cancel".
   const text = raw.trim();
-  if (MAIN_BTN_SET.has(text) || BET_FLOW_BTN_SET.has(text)) {
+  if (MAIN_BTN_SET.has(text) || BET_FLOW_BTN_SET.has(text) || SETTINGS_BTN_SET.has(text)) {
     withdrawDrafts.delete(userId);
     return false;
   }
@@ -2248,6 +2252,7 @@ export async function handleTextMessage(ctx: Context) {
   // (`$10` used to be parsed as a number and rejected as invalid).
   const isKnownButton =
     MAIN_BTN_SET.has(text) ||
+    SETTINGS_BTN_SET.has(text) ||
     AMOUNT_MAP[text] != null ||
     text === BTN.UP ||
     text === BTN.DOWN ||
@@ -2348,6 +2353,12 @@ export async function handleTextMessage(ctx: Context) {
       return handleStats(ctx);
     case BTN.SETTINGS:
       return handleSettings(ctx);
+    case BTN.EXPORT_KEY:
+      return handleExport(ctx);
+    case BTN.WITHDRAW:
+      return handleWithdraw(ctx);
+    case BTN.HELP:
+      return handleHelp(ctx);
     case BTN.PAUSE:
     case BTN.RESUME:
       return handlePauseToggle(ctx);

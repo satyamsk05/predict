@@ -17,7 +17,15 @@ import {
   priceDecimals,
 } from '../exchanges/predictfun/pricing.js';
 import { splitBooks, complement, normalizeLevels } from '../exchanges/predictfun/book.js';
-import { buildRoundCard, buildMainKeyboard, MAIN_BTN_SET, BTN, LEGACY_BTN } from '../bot/keyboards.js';
+import {
+  buildRoundCard,
+  buildMainKeyboard,
+  buildSettingsKeyboard,
+  MAIN_BTN_SET,
+  SETTINGS_BTN_SET,
+  BTN,
+  LEGACY_BTN,
+} from '../bot/keyboards.js';
 
 let passed = 0;
 function check(name: string, fn: () => void) {
@@ -196,6 +204,11 @@ check('labels from the previous keyboard still map to a current label', () => {
   for (const [old, now] of Object.entries(LEGACY_BTN)) {
     assert.ok(now === '/help' || Object.values(BTN).includes(now as any), old);
   }
+});
+check('settings keyboard buttons are all routable', () => {
+  const rows = buildSettingsKeyboard().keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
+  for (const t of rows) assert.ok(SETTINGS_BTN_SET.has(t), t);
+  assert.ok(rows.includes(BTN.EXPORT_KEY) && rows.includes(BTN.BACK));
 });
 check('round card: compact, no raw HTML specials, lock/test notices', () => {
   const card = buildRoundCard(
