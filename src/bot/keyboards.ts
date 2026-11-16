@@ -5,16 +5,17 @@ import type { ActiveRoundState } from '../services/roundWatcher.js';
 
 /** Persistent main menu — ReplyKeyboard (keyword buttons) */
 export const BTN = {
-  LIVE: 'Live',
-  QUICK_BET: 'Quick bet',
-  WALLET: 'Wallet',
-  OPEN: 'Positions',
-  ORDERS: 'Orders',
-  LOG: 'History',
-  PNL: 'PnL',
-  TREND: 'Book',
-  PAUSE: 'Mute alerts',
-  RESUME: 'Unmute alerts',
+  LIVE: '📈 Live',
+  QUICK_BET: '⚡ Quick bet',
+  WALLET: '💼 Wallet',
+  OPEN: '📂 Positions',
+  ORDERS: '📋 Orders',
+  LOG: '🕘 History',
+  PNL: '📊 PnL',
+  TREND: '📖 Book',
+  PAUSE: '🔕 Mute alerts',
+  RESUME: '🔔 Unmute alerts',
+  SETTINGS: '⚙️ Settings',
 
   UP: '🟢 UP',
   DOWN: '🔴 DOWN',
@@ -22,9 +23,9 @@ export const BTN = {
   A10: '$10',
   A25: '$25',
   A50: '$50',
-  CUSTOM: 'Custom',
-  CONFIRM: 'Confirm',
-  CANCEL: 'Cancel',
+  CUSTOM: '✏️ Custom',
+  CONFIRM: '✅ Confirm',
+  CANCEL: '❌ Cancel',
   BACK: '‹ Back',
 } as const;
 
@@ -39,6 +40,21 @@ export const MAIN_BTN_SET = new Set<string>([
   BTN.TREND,
   BTN.PAUSE,
   BTN.RESUME,
+  BTN.SETTINGS,
+]);
+
+/** Buttons used inside the quick-bet / confirm flow (side, amount, confirm, back). */
+export const BET_FLOW_BTN_SET = new Set<string>([
+  BTN.UP,
+  BTN.DOWN,
+  BTN.A5,
+  BTN.A10,
+  BTN.A25,
+  BTN.A50,
+  BTN.CUSTOM,
+  BTN.CONFIRM,
+  BTN.CANCEL,
+  BTN.BACK,
 ]);
 
 /**
@@ -52,6 +68,8 @@ export const LEGACY_BTN: Record<string, string> = {
   'Log': BTN.LOG,
   'Trend': BTN.TREND,
   '🩺 System': '/help',
+  '🖥️ Live': BTN.LIVE,
+  '⚡ Quick Bet': BTN.QUICK_BET,
   'Quick Bet': BTN.QUICK_BET,
   'PnL': BTN.PNL,
   '◾ Pause': BTN.PAUSE,
@@ -60,6 +78,7 @@ export const LEGACY_BTN: Record<string, string> = {
   '✅ Confirm': BTN.CONFIRM,
   '❌ Cancel': BTN.CANCEL,
   '« Back': BTN.BACK,
+  'Settings': BTN.SETTINGS,
 };
 
 function formatTimer(seconds: number): string {
@@ -135,7 +154,7 @@ export function buildAmountInline(side: 'UP' | 'DOWN'): InlineKeyboard {
     .text('‹ Back', 'r:rf');
 }
 
-/** Main 3×3 reply keyboard. */
+/** Main reply keyboard: quick actions, account views, settings and alerts. */
 export function buildMainKeyboard(paused = false): Keyboard {
   return new Keyboard()
     .text(BTN.LIVE)
@@ -148,6 +167,8 @@ export function buildMainKeyboard(paused = false): Keyboard {
     .row()
     .text(BTN.PNL)
     .text(BTN.TREND)
+    .text(BTN.SETTINGS)
+    .row()
     .text(paused ? BTN.RESUME : BTN.PAUSE)
     .resized()
     .persistent();
@@ -185,8 +206,18 @@ export function buildConfirmKeyboard(): Keyboard {
     .persistent();
 }
 
-/** One button per open position — tap to see details / close. */
-export function buildPositionsInline(
+/** Settings card: wallet security and account actions. */
+export function buildSettingsInline(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🔐 Export Private Key', 's:x')
+    .row()
+    .text('💸 Withdraw', 'w:s')
+    .text('❓ Help', 's:h')
+    .row()
+    .text('✕ Close', 's:c');
+}
+
+/** One button per open position — tap to see details / close. */export function buildPositionsInline(
   items: Array<{ key: string; label: string }>
 ): InlineKeyboard {
   const kb = new InlineKeyboard();

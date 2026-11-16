@@ -11,6 +11,7 @@ import { riskManager } from '../execution/risk.js';
 import {
   BTN,
   MAIN_BTN_SET,
+  BET_FLOW_BTN_SET,
   LEGACY_BTN,
   esc,
   buildRoundCard,
@@ -20,6 +21,7 @@ import {
   buildSideKeyboard,
   buildAmountKeyboard,
   buildConfirmKeyboard,
+  buildSettingsInline,
   buildPositionsInline,
   buildPositionActionsInline,
   buildPositionBackInline,
@@ -336,7 +338,20 @@ export async function handleUnban(ctx: Context) {
 
 function mainKb(ctx: Context) {
   const chatId = ctx.chat?.id;
+  // Sending the main keyboard replaces whatever bet-flow keyboard was on screen,
+  // so remember that /start no longer needs to re-attach it.
+  if (chatId) menuShown.add(chatId);
   return buildMainKeyboard(chatId ? isNotifyPaused(chatId) : false);
+}
+
+/**
+ * A bet-flow keyboard (side / amount / confirm) replaced the main menu. Clear
+ * the flag so the next /start re-attaches the main keyboard — otherwise tapping
+ * ‹ Back left the client stuck on the old UP/DOWN keyboard.
+ */
+function forgetMainMenu(ctx: Context) {
+  const chatId = ctx.chat?.id;
+  if (chatId) menuShown.delete(chatId);
 }
 
 function clearDraft(userId: number) {
@@ -378,7 +393,7 @@ export async function handleStart(ctx: Context) {
       `2. Check your balance under Wallet.`,
       `3. Start trading BTC 5M up/down with Quick bet.`,
       ``,
-      `Your private key is encrypted. Export it with <code>/export</code>.`,
+      `Your private key is encrypted. Back it up from Settings → Export Private Key.`,
       `To withdraw: Wallet → Withdraw.`,
     ].join('\n');
     return ctx.reply(welcome, {
@@ -405,10 +420,9 @@ export async function handleStart(ctx: Context) {
     });
   }
 
-  // The persistent menu survives in the client; (re)attach it once per chat.
+  // Re-attach the main keyboard whenever a bet-flow keyboard replaced it.
   const chatId = ctx.chat?.id;
   if (chatId && !menuShown.has(chatId)) {
-    menuShown.add(chatId);
     await ctx.reply('Menu ready.', { reply_markup: mainKb(ctx) });
   }
 
@@ -419,7 +433,7 @@ export async function handleStart(ctx: Context) {
   });
 }
 
-/** Chats that already received the persistent menu keyboard in this process. */
+/** Chats where the persistent main menu keyboard is currently displayed. */
 const menuShown: Set<number> = new Set();
 
 // ───────────────────────────────────────────────
@@ -439,13 +453,14 @@ export async function handleHelp(ctx: Context) {
     'Orders · resting orders, cancel',
     'History · recent trades    PnL · stats',
     'Book · order book for UP and DOWN',
+    'Settings · export private key, withdraw',
     '',
     '<b>Type a bet</b>',
     '<code>up 5</code>  $5 on UP at market',
     '<code>down 2 60</code>  $2 on DOWN, limit 60¢',
     '',
     '<b>Commands</b>',
-    '/up 10 · /down 10 · /orders · /export · /withdraw',
+    '/up 10 · /down 10 · /orders · /export · /settings · /withdraw',
     // `<id>` must be escaped: HTML parse mode rejects unknown tags.
     ...(adminGate(ctx) ? ['Admin: /users · /kick &lt;id&gt; · /unban &lt;id&gt; · /reset'] : []),
     '',
@@ -456,6 +471,37 @@ export async function handleHelp(ctx: Context) {
   ].join('\n');
 
   await ctx.reply(help, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+}
+
+// ───────────────────────────────────────────────
+// ⚙️ Settings — wallet security + account actions
+// ───────────────────────────────────────────────
+export async function handleSettings(ctx: Context) {
+  if (!isAllowed(ctx)) return notAllowed(ctx);
+
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const address = userAccounts.getAddress(userId);
+
+  const text = [
+    '⚙️ <b>Settings</b>',
+    '',
+    address
+      ? `Wallet\n<code>${esc(address)}</code>`
+      : 'Wallet not created yet — send /start.',
+    '',
+    '🔐 <b>Export private key</b> — back up this wallet or import it into MetaMask / Rabby / Trust Wallet.',
+    '💸 <b>Withdraw</b> — send USDT (BEP-20) to another address.',
+    '❓ <b>Help</b> — all commands and how the bot works.',
+    '',
+    '<i>The private key is shown in private chat only and the message deletes itself.</i>',
+  ].join('\n');
+
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    reply_markup: buildSettingsInline(),
+    link_preview_options: { is_disabled: true },
+  });
 }
 
 // ───────────────────────────────────────────────
@@ -610,6 +656,7 @@ async function showConfirm(
     .join('\n')
     .trim();
 
+  forgetMainMenu(ctx);
   await ctx.reply(confirmText, {
     parse_mode: 'HTML',
     reply_markup: buildConfirmKeyboard(),
@@ -638,6 +685,25 @@ export async function handleCallbackQuery(ctx: Context) {
     if (await handleExportCallback(ctx, data)) return;
     // Withdraw flow buttons (w:s / w:go / w:no)
     if (await handleWithdrawCallback(ctx, data)) return;
+
+    // Settings card: export key / help / close
+    if (data === 's:x') {
+      await ctx.answerCallbackQuery();
+      return handleExport(ctx);
+    }
+    if (data === 's:h') {
+      await ctx.answerCallbackQuery();
+      return handleHelp(ctx);
+    }
+    if (data === 's:c') {
+      await ctx.answerCallbackQuery();
+      try {
+        await ctx.deleteMessage();
+      } catch {
+        // message already gone
+      }
+      return;
+    }
 
     // Round card: refresh / inline bet flow
     if (data === 'r:rf') return refreshRoundCard(ctx);
@@ -1197,7 +1263,7 @@ export async function handleBalance(ctx: Context) {
     const address = rt.api.getEffectiveAddress();
     // Withdraw is private-chat only; don't render the button in a group.
     const kb =
-      ctx.chat?.type === 'private' ? new InlineKeyboard().text('Withdraw', 'w:s') : undefined;
+      ctx.chat?.type === 'private' ? new InlineKeyboard().text('💸 Withdraw', 'w:s') : undefined;
     await ctx.reply(
       [
         `<b>Wallet</b>`,
@@ -1577,23 +1643,17 @@ async function startWithdrawFlow(ctx: Context, userId: number, chatId: number) {
   } catch {
     // balance optional here
   }
-  await ctx.api.sendMessage(
-    chatId,
-    [
-      `<b>Withdraw USDT</b>`,
-      ``,
-      usdt !== undefined ? `Balance: <b>$${usdt.toFixed(2)} USDT</b>` : '',
-      ``,
-      `1. Paste the destination address (a BEP-20 wallet: Binance/OKX deposit address or your own).`,
-      `2️⃣ Phir amount mangege — ya <code>all</code> likh dena (sab balance).`,
-      `3. Confirm to send the USDT.`,
-      ``,
-      `Type <code>cancel</code> to stop.`,
-    ]
-      .filter(Boolean)
-      .join('\n'),
-    { parse_mode: 'HTML' }
+  const lines = ['💸 <b>Withdraw USDT</b>', '', 'Network: <b>BSC (BEP-20)</b>'];
+  if (usdt !== undefined) lines.push(`Available: <b>$${usdt.toFixed(2)} USDT</b>`);
+  lines.push(
+    '',
+    '<b>Step 1 of 2 · Destination</b>',
+    'Send the wallet address that should receive the USDT.',
+    'Binance / OKX BEP-20 deposit address, or any wallet you control.',
+    '',
+    '<i>Type</i> <code>cancel</code> <i>to stop.</i>'
   );
+  await ctx.api.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
 }
 
 /** `/withdraw` — same flow as 🏦 Wallet → 💸 Withdraw. */
@@ -1656,7 +1716,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
 
   // w:go — confirmed send
   if (!draft?.address || draft.amount === undefined) {
-    await ctx.answerCallbackQuery({ text: '⚠️ Flow expired — Wallet → Withdraw se dobara', show_alert: true });
+    await ctx.answerCallbackQuery({ text: '⚠️ Flow expired — open Wallet → Withdraw again', show_alert: true });
     return true;
   }
 
@@ -1680,15 +1740,16 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
     await ctx.api.sendMessage(
       chatId,
       [
-        `✅ <b>Sent Done!</b>`,
+        `✅ <b>Withdrawal sent</b>`,
         ``,
-        `Amount: <b>${draft.amount === 'all' ? 'Full balance' : `$${draft.amount.toFixed(2)} USDT`}</b>`,
-        `To: <code>${draft.address}</code>`,
+        `Amount    <b>${draft.amount === 'all' ? 'Full balance' : `$${draft.amount.toFixed(2)} USDT`}</b>`,
+        `To        <code>${draft.address}</code>`,
+        `Network   BSC (BEP-20)`,
         txUrl(hash)
-          ? `TX: <a href="${txUrl(hash)}">${hash.slice(0, 10)}…${hash.slice(-6)}</a> ↗`
-          : `TX: <code>${hash}</code>`,
+          ? `TX        <a href="${txUrl(hash)}">${hash.slice(0, 10)}…${hash.slice(-6)}</a> ↗`
+          : `TX        <code>${hash}</code>`,
         ``,
-        `It should arrive in 1-2 minutes.`,
+        `It usually arrives in 1–2 minutes.`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1717,9 +1778,11 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   const draft = getWithdrawDraft(userId);
   if (!draft) return false;
 
-  // Tapping a menu button means "leave this flow". Without this, "🖥️ Live" etc.
-  // were parsed as a wallet address and the user was stuck until typing "cancel".
-  if (MAIN_BTN_SET.has(raw.trim())) {
+  // Tapping a menu or bet-flow button means "leave this flow". Without this,
+  // "Live" or "$5" was parsed as a wallet address and the user got stuck until
+  // typing "cancel".
+  const text = raw.trim();
+  if (MAIN_BTN_SET.has(text) || BET_FLOW_BTN_SET.has(text)) {
     withdrawDrafts.delete(userId);
     return false;
   }
@@ -1732,8 +1795,6 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     });
     return true;
   }
-
-  const text = raw.trim();
 
   if (text.toLowerCase() === 'cancel') {
     withdrawDrafts.delete(userId);
@@ -1749,7 +1810,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     const addr = text.replace(/\s+/g, '');
     if (!isValidBscAddress(addr)) {
       await ctx.reply(
-        'That is not a valid BEP-20 address (0x + 40 hex characters).\nPaste it again or type <code>cancel</code>.',
+        '❌ That is not a valid BEP-20 address.\nSend <code>0x…</code> (0x + 40 characters) or type <code>cancel</code>.',
         { parse_mode: 'HTML' }
       );
       return true;
@@ -1757,12 +1818,14 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     draft.address = addr;
     await ctx.reply(
       [
-        `✅ Address set: <code>${addr}</code>`,
+        '✅ <b>Destination saved</b>',
+        `<code>${addr}</code>`,
         ``,
-        `2️⃣ Ab <b>amount likho</b> (USDT me, e.g. <code>10</code>)`,
-        `ya <code>all</code> likho — pura balance withdraw hoga.`,
+        '<b>Step 2 of 2 · Amount</b>',
+        'How much USDT should be sent?',
+        'Type a number like <code>10</code>, or <code>all</code> for the full balance.',
         ``,
-        `Type <code>cancel</code> to stop.`,
+        '<i>Type</i> <code>cancel</code> <i>to stop.</i>',
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1795,14 +1858,15 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   } else {
     const n = parseFloat(text);
     if (!(n > 0)) {
-      await ctx.reply('❌ Invalid amount. Number likho (e.g. <code>10</code>) ya <code>all</code>.', {
-        parse_mode: 'HTML',
-      });
+      await ctx.reply(
+        '❌ Enter a valid amount, e.g. <code>10</code>, or type <code>all</code> for the full balance.',
+        { parse_mode: 'HTML' }
+      );
       return true;
     }
     if (n > balance + 1e-9) {
       await ctx.reply(
-        `Your wallet holds only <b>$${balance.toFixed(2)} USDT</b>. Enter less, or <code>all</code>.`,
+        `Amount is more than your balance (<b>$${balance.toFixed(2)} USDT</b>).\nEnter a smaller amount or type <code>all</code>.`,
         { parse_mode: 'HTML' }
       );
       return true;
@@ -1811,19 +1875,21 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   }
 
   draft.amount = amount;
-  const amountStr = amount === 'all' ? `Full balance ($${balance.toFixed(2)})` : `$${amount.toFixed(2)}`;
+  const amountStr =
+    amount === 'all' ? `Full balance ($${balance.toFixed(2)})` : `$${amount.toFixed(2)}`;
   const kb = new InlineKeyboard()
     .text('✅ Confirm & Send', 'w:go')
     .text('❌ Cancel', 'w:no');
   await ctx.reply(
     [
-      `<b>Confirm Withdrawal</b>`,
+      `<b>Confirm withdrawal</b>`,
       ``,
-      `Amount: <b>${amountStr} USDT</b>`,
-      `To: <code>${draft.address}</code>`,
+      `Amount    <b>${amountStr} USDT</b>`,
+      `To        <code>${draft.address}</code>`,
+      `Network   BSC (BEP-20)`,
       ``,
-      `BEP-20 addresses only. Funds sent to the wrong network can be lost.`,
-      `Tap Confirm to send the USDT.`,
+      `<i>Double-check the address. BEP-20 transfers cannot be reversed.</i>`,
+      `Tap <b>Confirm & Send</b> to continue.`,
     ].join('\n'),
     { parse_mode: 'HTML', reply_markup: kb }
   );
@@ -2136,6 +2202,7 @@ async function startQuickBet(ctx: Context) {
   if (ctx.from?.id) {
     betDraft.set(ctx.from.id, {});
   }
+  forgetMainMenu(ctx);
   await ctx.reply('<b>Quick bet</b>: pick a side.', {
     parse_mode: 'HTML',
     reply_markup: buildSideKeyboard(),
@@ -2193,6 +2260,7 @@ export async function handleTextMessage(ctx: Context) {
   if (draft?.awaitingCustom && !isKnownButton) {
     const amount = parseFloat(text);
     if (!Number.isFinite(amount) || amount <= 0) {
+      forgetMainMenu(ctx);
       return ctx.reply(
         '❌ Invalid amount. Enter a number like <code>10</code> or <code>25.5</code>',
         { parse_mode: 'HTML', reply_markup: buildAmountKeyboard() }
@@ -2229,6 +2297,7 @@ export async function handleTextMessage(ctx: Context) {
   if (text === BTN.UP || text === BTN.DOWN) {
     const outcome = text === BTN.UP ? 'UP' : 'DOWN';
     betDraft.set(userId, { outcome });
+    forgetMainMenu(ctx);
     return ctx.reply(`${text} — select amount:`, {
       reply_markup: buildAmountKeyboard(),
     });
@@ -2247,6 +2316,7 @@ export async function handleTextMessage(ctx: Context) {
     const outcome = draft?.outcome;
     if (!outcome) return startQuickBet(ctx);
     betDraft.set(userId, { outcome, awaitingCustom: true });
+    forgetMainMenu(ctx);
     return ctx.reply(
       '✏️ Type your custom amount in USDT (e.g. <code>25.5</code>)',
       { parse_mode: 'HTML', reply_markup: buildAmountKeyboard() }
@@ -2276,6 +2346,8 @@ export async function handleTextMessage(ctx: Context) {
       return startQuickBet(ctx);
     case BTN.PNL:
       return handleStats(ctx);
+    case BTN.SETTINGS:
+      return handleSettings(ctx);
     case BTN.PAUSE:
     case BTN.RESUME:
       return handlePauseToggle(ctx);

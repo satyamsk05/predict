@@ -20,6 +20,7 @@ import {
   handleKick,
   handleUnban,
   handleWithdraw,
+  handleSettings,
 } from './handlers.js';
 
 export function createBot() {
@@ -61,6 +62,7 @@ export function createBot() {
   bot.command('orderbook', handleOrderbook);
   bot.command('reset', handleReset);
   bot.command('export', handleExport);
+  bot.command('settings', handleSettings);
   bot.command('withdraw', handleWithdraw);
   // Multi-user management — admin-only (no approval: /start auto-creates)
   bot.command('users', handleUsers);

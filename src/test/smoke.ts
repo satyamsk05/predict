@@ -186,8 +186,9 @@ check('empty side on UP means the opposite DOWN side is empty', () => {
 console.log('menu');
 check('main keyboard buttons are all routable', () => {
   const rows = buildMainKeyboard(false).keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
-  assert.equal(rows.length, 9);
+  assert.equal(rows.length, 10);
   for (const t of rows) assert.ok(MAIN_BTN_SET.has(t), t);
+  assert.ok(rows.includes(BTN.SETTINGS));
   const muted = buildMainKeyboard(true).keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
   assert.ok(muted.includes(BTN.RESUME) && !muted.includes(BTN.PAUSE));
 });
