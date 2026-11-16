@@ -15,7 +15,7 @@ export const BTN = {
   TREND: '📖 Book',
   PAUSE: '🔕 Mute alerts',
   RESUME: '🔔 Unmute alerts',
-  SETTINGS: '⚙️ Settings',
+  PROFILE: '👤 Profile',
 
   EXPORT_KEY: '🔐 Export Key',
   WITHDRAW: '💸 Withdraw',
@@ -44,7 +44,7 @@ export const MAIN_BTN_SET = new Set<string>([
   BTN.TREND,
   BTN.PAUSE,
   BTN.RESUME,
-  BTN.SETTINGS,
+  BTN.PROFILE,
 ]);
 
 /** Buttons used inside the quick-bet / confirm flow (side, amount, confirm, back). */
@@ -61,10 +61,13 @@ export const BET_FLOW_BTN_SET = new Set<string>([
   BTN.BACK,
 ]);
 
-/** Buttons used inside the Settings screen. */
+/** Buttons used inside the Profile screen. */
 export const SETTINGS_BTN_SET = new Set<string>([
   BTN.EXPORT_KEY,
   BTN.WITHDRAW,
+  BTN.LOG,
+  BTN.PAUSE,
+  BTN.RESUME,
   BTN.HELP,
   BTN.BACK,
 ]);
@@ -90,7 +93,8 @@ export const LEGACY_BTN: Record<string, string> = {
   '✅ Confirm': BTN.CONFIRM,
   '❌ Cancel': BTN.CANCEL,
   '« Back': BTN.BACK,
-  'Settings': BTN.SETTINGS,
+  'Settings': BTN.PROFILE,
+  '⚙️ Settings': BTN.PROFILE,
 };
 
 function formatTimer(seconds: number): string {
@@ -127,16 +131,16 @@ export function buildRoundCard(round: ActiveRoundState, balance?: number): strin
   const trend = round.currentTrend === 'UP' ? '🟢' : round.currentTrend === 'DOWN' ? '🔴' : '';
 
   const lines = [
-    `<b>${esc(round.title)}</b>  ·  ${formatTimer(round.secondsRemaining)} left`,
+    `📈 <b>${esc(round.title)}</b>  ·  ⏳ ${formatTimer(round.secondsRemaining)} left`,
     ``,
-    `Lock   ${lockKnown ? `$${esc(formatPrice(round.lockPrice))}` : 'syncing…'}`,
-    `Now    ${priceKnown ? `$${esc(formatPrice(round.currentPrice))}  ${esc(diffStr)} ${trend}`.trim() : 'connecting…'}`,
+    `🔒 Lock   ${lockKnown ? `$${esc(formatPrice(round.lockPrice))}` : 'syncing…'}`,
+    `💹 Now    ${priceKnown ? `$${esc(formatPrice(round.currentPrice))}  ${esc(diffStr)} ${trend}`.trim() : 'connecting…'}`,
     ``,
     `<b>UP</b> ${(round.upPrice * 100).toFixed(0)}¢ (${esc(upPayout)}x)   <b>DOWN</b> ${(round.downPrice * 100).toFixed(0)}¢ (${esc(downPayout)}x)`,
   ];
-  if (balance !== undefined) lines.push(``, `Balance  $${esc(formatPrice(balance))}`);
-  if (round.isLocked) lines.push(``, `<b>Betting locked</b>. Round is closing.`);
-  if (config.trading.dryRun) lines.push(``, `<i>Test mode: no real orders</i>`);
+  if (balance !== undefined) lines.push(``, `💰 Balance  $${esc(formatPrice(balance))}`);
+  if (round.isLocked) lines.push(``, `🔒 <b>Betting locked</b>. Round is closing.`);
+  if (config.trading.dryRun) lines.push(``, `<i>🧪 Test mode: no real orders</i>`);
   const link = linkLine(marketUrl(round.roundSlug), 'Market');
   return lines.join('\n') + link;
 }
@@ -151,7 +155,7 @@ export function buildRoundInline(round: ActiveRoundState): InlineKeyboard {
     );
     kb.row();
   }
-  return kb.text('Refresh', 'r:rf');
+  return kb.text('🔄 Refresh', 'r:rf');
 }
 
 /** Amount presets for an inline bet (side is UP or DOWN). */
@@ -166,8 +170,8 @@ export function buildAmountInline(side: 'UP' | 'DOWN'): InlineKeyboard {
     .text('‹ Back', 'r:rf');
 }
 
-/** Main reply keyboard: quick actions, account views, settings and alerts. */
-export function buildMainKeyboard(paused = false): Keyboard {
+/** Main reply keyboard: quick actions and account views. */
+export function buildMainKeyboard(): Keyboard {
   return new Keyboard()
     .text(BTN.LIVE)
     .text(BTN.QUICK_BET)
@@ -175,13 +179,10 @@ export function buildMainKeyboard(paused = false): Keyboard {
     .row()
     .text(BTN.OPEN)
     .text(BTN.ORDERS)
-    .text(BTN.LOG)
+    .text(BTN.PROFILE)
     .row()
     .text(BTN.PNL)
     .text(BTN.TREND)
-    .text(BTN.SETTINGS)
-    .row()
-    .text(paused ? BTN.RESUME : BTN.PAUSE)
     .resized()
     .persistent();
 }
@@ -218,11 +219,14 @@ export function buildConfirmKeyboard(): Keyboard {
     .persistent();
 }
 
-/** Settings actions live in the reply keyboard, like the Quick bet flow. */
-export function buildSettingsKeyboard(): Keyboard {
+/** Profile actions live in the reply keyboard, like the Quick bet flow. */
+export function buildSettingsKeyboard(paused = false): Keyboard {
   return new Keyboard()
     .text(BTN.EXPORT_KEY)
     .text(BTN.WITHDRAW)
+    .row()
+    .text(BTN.LOG)
+    .text(paused ? BTN.RESUME : BTN.PAUSE)
     .row()
     .text(BTN.HELP)
     .text(BTN.BACK)

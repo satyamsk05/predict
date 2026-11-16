@@ -342,7 +342,14 @@ function mainKb(ctx: Context) {
   // Sending the main keyboard replaces whatever bet-flow keyboard was on screen,
   // so remember that /start no longer needs to re-attach it.
   if (chatId) menuShown.add(chatId);
-  return buildMainKeyboard(chatId ? isNotifyPaused(chatId) : false);
+  return buildMainKeyboard();
+}
+
+/** Profile keyboard with the current alert state, and main menu marked detached. */
+function profileKb(ctx: Context) {
+  const chatId = ctx.chat?.id;
+  forgetMainMenu(ctx);
+  return buildSettingsKeyboard(chatId ? isNotifyPaused(chatId) : false);
 }
 
 /**
@@ -384,9 +391,9 @@ export async function handleStart(ctx: Context) {
 
   if (created) {
     const welcome = [
-      `<b>Welcome. Your trading account is ready.</b>`,
+      `🎉 <b>Welcome. Your trading account is ready.</b>`,
       ``,
-      `<b>Your wallet</b> (yours alone):`,
+      `💼 <b>Your wallet</b> (yours alone):`,
       `<code>${account.address}</code>`,
       linkLine(addressUrl(account.address), 'View on BSCScan'),
       ``,
@@ -394,7 +401,7 @@ export async function handleStart(ctx: Context) {
       `2. Check your balance under Wallet.`,
       `3. Start trading BTC 5M up/down with Quick bet.`,
       ``,
-      `Your private key is encrypted. Back it up from Settings → Export Private Key.`,
+      `Your private key is encrypted. Back it up from 👤 Profile → 🔐 Export Key.`,
       `To withdraw: Wallet → Withdraw.`,
     ].join('\n');
     return ctx.reply(welcome, {
@@ -416,7 +423,7 @@ export async function handleStart(ctx: Context) {
   }
 
   if (!round) {
-    return ctx.reply('Loading the current BTC 5M round. Try again in a moment.', {
+    return ctx.reply('⏳ Loading the current BTC 5M round. Try again in a moment.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -424,7 +431,7 @@ export async function handleStart(ctx: Context) {
   // Re-attach the main keyboard whenever a bet-flow keyboard replaced it.
   const chatId = ctx.chat?.id;
   if (chatId && !menuShown.has(chatId)) {
-    await ctx.reply('Menu ready.', { reply_markup: mainKb(ctx) });
+    await ctx.reply('📋 Menu ready.', { reply_markup: mainKb(ctx) });
   }
 
   await ctx.reply(buildRoundCard(round, balance), {
@@ -440,28 +447,28 @@ const menuShown: Set<number> = new Set();
 // ───────────────────────────────────────────────
 // /help + System
 // ───────────────────────────────────────────────
-export async function handleHelp(ctx: Context) {
+export async function handleHelp(ctx: Context, fromProfile = false) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
 
   const stats = riskManager.getStats();
   const help = [
-    '<b>Help</b>',
+    '❓ <b>Help</b>',
     '',
-    'Live · current round, tap UP or DOWN to bet',
-    'Quick bet · pick a side and amount',
-    'Wallet · balance, deposit address, withdraw',
-    'Positions · open positions, close / sell',
-    'Orders · resting orders, cancel',
-    'History · recent trades    PnL · stats',
-    'Book · order book for UP and DOWN',
-    'Settings · export private key, withdraw',
+    '📈 Live · current round, tap UP or DOWN to bet',
+    '⚡ Quick bet · pick a side and amount',
+    '💼 Wallet · balance, deposit address, withdraw',
+    '📂 Positions · open positions, close / sell',
+    '📋 Orders · resting orders, cancel',
+    '🕘 History · recent trades    📊 PnL · stats',
+    '📖 Book · order book for UP and DOWN',
+    '👤 Profile · export key, withdraw, alerts',
     '',
     '<b>Type a bet</b>',
     '<code>up 5</code>  $5 on UP at market',
     '<code>down 2 60</code>  $2 on DOWN, limit 60¢',
     '',
     '<b>Commands</b>',
-    '/up 10 · /down 10 · /orders · /export · /settings · /withdraw',
+    '/up 10 · /down 10 · /orders · /export · /profile · /withdraw',
     // `<id>` must be escaped: HTML parse mode rejects unknown tags.
     ...(adminGate(ctx) ? ['Admin: /users · /kick &lt;id&gt; · /unban &lt;id&gt; · /reset'] : []),
     '',
@@ -471,11 +478,14 @@ export async function handleHelp(ctx: Context) {
     `Circuit breaker: ${stats.isTripped ? 'TRIPPED' : 'armed'}`,
   ].join('\n');
 
-  await ctx.reply(help, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  await ctx.reply(help, {
+    parse_mode: 'HTML',
+    reply_markup: fromProfile ? profileKb(ctx) : mainKb(ctx),
+  });
 }
 
 // ───────────────────────────────────────────────
-// ⚙️ Settings — wallet security + account actions
+// 👤 Profile — wallet, key export, withdraw, alerts
 // ───────────────────────────────────────────────
 export async function handleSettings(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
@@ -483,27 +493,29 @@ export async function handleSettings(ctx: Context) {
   const userId = ctx.from?.id;
   if (!userId) return;
   const address = userAccounts.getAddress(userId);
+  const paused = ctx.chat?.id ? isNotifyPaused(ctx.chat.id) : false;
 
   const text = [
-    '⚙️ <b>Settings</b>',
+    '👤 <b>Profile</b>',
     '',
     address
-      ? `Wallet\n<code>${esc(address)}</code>`
-      : 'Wallet not created yet — send /start.',
+      ? `💼 Wallet\n<code>${esc(address)}</code>`
+      : '💼 Wallet not created yet — send /start.',
     '',
     '🔐 <b>Export Key</b> — back up this wallet or import it into MetaMask / Rabby / Trust Wallet.',
     '💸 <b>Withdraw</b> — send USDT (BEP-20) to another address.',
+    `🕘 <b>History</b> — your recent trades.`,
+    `${paused ? '🔔' : '🔕'} <b>${paused ? 'Unmute alerts' : 'Mute alerts'}</b> — control round notifications.`,
     '❓ <b>Help</b> — all commands and how the bot works.',
     '',
     '<i>The private key is shown in private chat only and the message deletes itself.</i>',
     `<i>Tap a button below, or ‹ Back for the main menu.</i>`,
   ].join('\n');
 
-  // Settings actions live in the keyboard itself, like the Quick bet flow.
-  forgetMainMenu(ctx);
+  // Profile actions live in the keyboard itself, like the Quick bet flow.
   await ctx.reply(text, {
     parse_mode: 'HTML',
-    reply_markup: buildSettingsKeyboard(),
+    reply_markup: profileKb(ctx),
     link_preview_options: { is_disabled: true },
   });
 }
@@ -578,28 +590,28 @@ async function showConfirm(
 
   const userCheck = userRegistry.canBet(userId);
   if (!userCheck.allowed) {
-    return ctx.reply(`<b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
+    return ctx.reply(`⛔ <b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
   }
 
   if (!round) {
-    return ctx.reply('❌ No active round found. Please try again in a moment.', {
+    return ctx.reply('⏳ No active round found. Please try again in a moment.', {
       reply_markup: mainKb(ctx),
     });
   }
 
   if (round.isLocked) {
     return ctx.reply(
-      `Round is locked! Less than ${config.trading.lockGuardSeconds}s remaining.\nWait for the next round.`,
+      `🔒 Round is locked! Less than ${config.trading.lockGuardSeconds}s remaining.\nWait for the next round.`,
       { reply_markup: mainKb(ctx) }
     );
   }
 
   const { allowed, reason } = riskManager.canTrade(amountUsdt, userId);
   if (!allowed) {
-    return ctx.reply(`<b>Trade Blocked</b>\n${esc(reason)}`, {
+    return ctx.reply(`⛔ <b>Trade Blocked</b>\n${esc(reason)}`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -639,23 +651,23 @@ async function showConfirm(
   });
 
   const confirmText = [
-    `<b>Confirm Your Bet</b>`,
+    `🎯 <b>Confirm Your Bet</b>`,
     ``,
-    `Market: ${esc(round.title)}`,
-    `Outcome: ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
-    `Price: ${(price * 100).toFixed(0)}¢ per share${isLimit ? ' (limit)' : ''}`,
-    `Amount: <b>$${amountUsdt.toFixed(2)} USDT</b>`,
-    `Shares: ${shares.toFixed(2)}`,
-    `Est. Payout: <b>$${payout.toFixed(2)} USDT</b> (before fees)`,
-    `Est. Profit: <b>+$${profit.toFixed(2)} USDT</b> (${((profit / amountUsdt) * 100).toFixed(1)}%)`,
-    feePct > 0 ? `Market fee: ${feePct.toFixed(2)}%` : '',
+    `📈 Market: ${esc(round.title)}`,
+    `🎯 Outcome: ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
+    `🏷️ Price: ${(price * 100).toFixed(0)}¢ per share${isLimit ? ' (limit)' : ''}`,
+    `💵 Amount: <b>$${amountUsdt.toFixed(2)} USDT</b>`,
+    `🧾 Shares: ${shares.toFixed(2)}`,
+    `💰 Est. Payout: <b>$${payout.toFixed(2)} USDT</b> (before fees)`,
+    `📈 Est. Profit: <b>+$${profit.toFixed(2)} USDT</b> (${((profit / amountUsdt) * 100).toFixed(1)}%)`,
+    feePct > 0 ? `🏦 Market fee: ${feePct.toFixed(2)}%` : '',
     linkLine(marketUrl(round.roundSlug), 'Open market'),
     isLimit
       ? belowMarket
         ? `Below market (${(marketPrice * 100).toFixed(0)}¢): it will rest on the book and become a position when filled.`
         : `Limit is at or above market, so it should fill right away.`
       : `Market order: may pay up to the ${(config.trading.slippageBps / 100).toFixed(1)}% slippage cap if the price moves.`,
-    config.trading.dryRun ? `\n<b>DRY RUN — No real order</b>` : '',
+    config.trading.dryRun ? `\n🧪 <b>DRY RUN — No real order</b>` : '',
   ]
     .join('\n')
     .trim();
@@ -794,20 +806,20 @@ async function showPositionDetail(ctx: Context, key: string) {
   const entry = parseFloat(pos.avgEntryPrice) || 0;
 
   const text = [
-    `<b>Position</b>`,
+    `📂 <b>Position</b>`,
     ``,
-    `Market: ${esc(pos.marketTitle || pos.marketId)}`,
+    `📈 Market: ${esc(pos.marketTitle || pos.marketId)}`,
     linkLine(marketUrl(pos.slug), 'Open market'),
-    `Outcome: ${outcomeToSide(pos.outcome) === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
-    `Shares: <b>${pos.shares.toFixed(4)}</b>`,
-    entry > 0 ? `Entry: ${(entry * 100).toFixed(1)}¢` : '',
-    bid != null ? `Sell now (best bid): <b>${(bid * 100).toFixed(1)}¢</b>` : 'No buyer right now',
+    `🎯 Outcome: ${outcomeToSide(pos.outcome) === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
+    `🧾 Shares: <b>${pos.shares.toFixed(4)}</b>`,
+    entry > 0 ? `💵 Entry: ${(entry * 100).toFixed(1)}¢` : '',
+    bid != null ? `🏷️ Sell now (best bid): <b>${(bid * 100).toFixed(1)}¢</b>` : '📭 No buyer right now',
     ...(bid != null
       ? (() => {
           const q = positionPnl(pos, bid);
           return [
-            `Value: <b>$${q.value.toFixed(2)}</b>`,
-            `PnL: <b>${fmtPnl(q)}</b> (${fmtPct(q)})`,
+            `💰 Value: <b>$${q.value.toFixed(2)}</b>`,
+            `📊 PnL: <b>${fmtPnl(q)}</b> (${fmtPct(q)})`,
           ];
         })()
       : []),
@@ -873,8 +885,7 @@ async function closePosition(ctx: Context, key: string) {
   if (config.trading.dryRun) {
     return ctx.editMessageText(
       [
-        `<b>[TEST MODE]</b> Sell simulated. No real order was sent.`,
-        ``,
+        `🧪 <b>[TEST MODE]</b> Sell simulated. No real order was sent.`,        ``,
         `Would sell: ${pos.shares.toFixed(4)} ${side} @ ${(bid * 100).toFixed(0)}¢`,
         `Proceeds: ~$${q.value.toFixed(2)} USDT`,
         `Profit: <b>${fmtPnl(q)}</b> (${fmtPct(q)}) <i>(before fees)</i>`,
@@ -1002,7 +1013,7 @@ async function placeOrder(
   if (userId) {
     const userCheck = userRegistry.canBet(userId);
     if (!userCheck.allowed) {
-      return ctx.reply(`<b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
+      return ctx.reply(`⛔ <b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
         parse_mode: 'HTML',
         reply_markup: mainKb(ctx),
       });
@@ -1099,7 +1110,7 @@ async function placeOrder(
         : amountUsdt * (1 + config.trading.slippageBps / 10000);
       if (bal.usdt + 1e-9 < needed) {
         return ctx.reply(
-          `<b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
+          `⚠️ <b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
           { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
         );
       }
@@ -1236,8 +1247,7 @@ async function confirmFillAndNotify(
   await ctx.api
     .sendMessage(
       chatId,
-      `<b>Not filled yet.</b> The order may be resting on the book until the round ends.\nCheck Orders to see it or cancel it.`,
-      { parse_mode: 'HTML' }
+      `⏳ <b>Not filled yet.</b> The order may be resting on the book until the round ends.\nCheck Orders to see it or cancel it.`,      { parse_mode: 'HTML' }
     )
     .catch(() => {});
 }
@@ -1260,7 +1270,7 @@ export async function handleBalance(ctx: Context) {
   try {
     const { usdt, bnb, ok } = await rt.api.getBalance();
     if (!ok) {
-      return ctx.reply('Could not fetch your balance (RPC error). Try again shortly.', {
+      return ctx.reply('📡 Could not fetch your balance (RPC error). Try again shortly.', {
         reply_markup: mainKb(ctx),
       });
     }
@@ -1270,11 +1280,11 @@ export async function handleBalance(ctx: Context) {
       ctx.chat?.type === 'private' ? new InlineKeyboard().text('💸 Withdraw', 'w:s') : undefined;
     await ctx.reply(
       [
-        `<b>Wallet</b>`,
+        `💼 <b>Wallet</b>`,
         ``,
-        `USDT: <b>$${usdt.toFixed(2)}</b>`,
-        `BNB:  <b>${bnb.toFixed(4)} BNB</b> (gas)`,
-        address ? `\nAddress: <code>${address}</code>` : '',
+        `🪙 USDT: <b>$${usdt.toFixed(2)}</b>`,
+        `⛽ BNB:  <b>${bnb.toFixed(4)} BNB</b> (gas)`,
+        address ? `\n📍 Address: <code>${address}</code>` : '',
         linkLine(portfolioUrl(address), 'Portfolio on Predict.fun'),
         linkLine(addressUrl(address), 'View on BSCScan'),
         ``,
@@ -1317,11 +1327,11 @@ export async function handlePositions(ctx: Context) {
     const positions = await rt.api.getPositions({ isResolved: false });
     const open = positions.filter((p) => !p.isResolved);
     if (open.length === 0) {
-      return ctx.reply('No open positions found.', { reply_markup: mainKb(ctx) });
+      return ctx.reply('📭 No open positions found.', { reply_markup: mainKb(ctx) });
     }
 
     const cached = cachePositions(chatId, open.slice(0, 10));
-    const lines = ['<b>Open Positions</b>', '<i>Tap a position to view / close it.</i>', ''];
+    const lines = ['📂 <b>Open Positions</b>', '<i>Tap a position to view / close it.</i>', ''];
 
     for (const { position: pos } of cached) {
       const title = pos.marketTitle || pos.marketId;
@@ -1329,7 +1339,7 @@ export async function handlePositions(ctx: Context) {
       const bid = parseFloat(pos.currentPrice || '0');
       const quote = bid > 0 && bid < 1 ? positionPnl(pos, bid) : null;
 
-      lines.push(`<b>${esc(title)}</b>`);
+      lines.push(`📈 <b>${esc(title)}</b>`);
       lines.push(
         `  ${esc(pos.outcome)}: ${pos.shares.toFixed(2)} shares` +
           (entryPrice > 0 ? ` @ ${(entryPrice * 100).toFixed(0)}¢` : '') +
@@ -1379,23 +1389,23 @@ export async function handleStats(ctx: Context) {
   const mine = userId ? userRegistry.getStats(userId) : null;
 
   const text = [
-    `<b>PnL / Statistics</b>`,
+    `📊 <b>PnL / Statistics</b>`,
     ``,
-    `BTC Price: <b>$${btcNow.toLocaleString()}</b>`,
+    `💹 BTC Price: <b>$${btcNow.toLocaleString()}</b>`,
     ``,
     mine
-      ? `<b>You:</b> ${mine.trades} trades · PnL ${mine.pnlUsd >= 0 ? '+' : ''}$${mine.pnlUsd.toFixed(2)} · Today's loss $${mine.dailyLossUsd.toFixed(2)}`
+      ? `👤 <b>You:</b> ${mine.trades} trades · PnL ${mine.pnlUsd >= 0 ? '+' : ''}$${mine.pnlUsd.toFixed(2)} · Today's loss $${mine.dailyLossUsd.toFixed(2)}`
       : '',
-    `Today's Trades: ${stats.dailyTrades}`,
-    `Today's Loss: $${stats.dailyLoss.toFixed(2)} / $${config.trading.dailyLossLimitUsdt}`,
-    `Open Exposure: $${riskManager.getOpenExposureUsdt(userId).toFixed(2)}`,
-    `Win Rate: ${stats.winRate}%`,
-    `Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '+' : ''}$${stats.totalPnl}`,
+    `📈 Today's Trades: ${stats.dailyTrades}`,
+    `📉 Today's Loss: $${stats.dailyLoss.toFixed(2)} / $${config.trading.dailyLossLimitUsdt}`,
+    `💼 Open Exposure: $${riskManager.getOpenExposureUsdt(userId).toFixed(2)}`,
+    `🏆 Win Rate: ${stats.winRate}%`,
+    `💰 Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '+' : ''}$${stats.totalPnl}`,
     ``,
-    `Circuit Breaker: ${stats.isTripped ? 'TRIPPED — ' + stats.tripReason : '✅ Armed'}`,
-    `Mode: ${stats.isDryRun ? 'DRY RUN' : '🔴 LIVE'}`,
-    `Max Bet: $${config.trading.maxBetUsdt} USDT`,
-    `Personal daily cap: $${userRegistry.userDailyLossLimit()} USDT`,
+    `🛡️ Circuit Breaker: ${stats.isTripped ? 'TRIPPED — ' + stats.tripReason : '✅ Armed'}`,
+    `⚙️ Mode: ${stats.isDryRun ? 'DRY RUN' : '🔴 LIVE'}`,
+    `🎯 Max Bet: $${config.trading.maxBetUsdt} USDT`,
+    `📅 Personal daily cap: $${userRegistry.userDailyLossLimit()} USDT`,
   ].join('\n');
 
   await ctx.reply(text, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
@@ -1404,8 +1414,9 @@ export async function handleStats(ctx: Context) {
 // ───────────────────────────────────────────────
 // /history → Log
 // ───────────────────────────────────────────────
-export async function handleHistory(ctx: Context) {
+export async function handleHistory(ctx: Context, fromProfile = false) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
+  const kb = fromProfile ? profileKb(ctx) : mainKb(ctx);
 
   const userId = ctx.from?.id;
   // Admins see the club log; members see ONLY their own trades (never a
@@ -1414,13 +1425,12 @@ export async function handleHistory(ctx: Context) {
   const trades = riskManager.getRecentTrades(isAdmin ? undefined : userId, 20);
 
   if (trades.length === 0) {
-    return ctx.reply(
-      isAdmin ? 'No trade history yet.' : 'No trades yet.',
-      { reply_markup: mainKb(ctx) }
-    );
+    return ctx.reply(isAdmin ? '📭 No trade history yet.' : '📭 No trades yet.', {
+      reply_markup: kb,
+    });
   }
 
-  const lines = ['<b>Recent Trades</b>', ''];
+  const lines = ['🕘 <b>Recent Trades</b>', ''];
   for (const t of [...trades].reverse()) {
     const date = new Date(t.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
     const pnlStr =
@@ -1435,7 +1445,7 @@ export async function handleHistory(ctx: Context) {
     );
   }
 
-  await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: kb });
 }
 
 // ───────────────────────────────────────────────
@@ -1486,8 +1496,9 @@ async function sendKeyMessage(
       '<b>PRIVATE KEY — HANDLE WITH CARE</b>',
       ``,
       `Address: <code>${esc(address)}</code>`,
-      `Key: <code>${esc(key)}</code>`,
+      `Key: <span class="tg-spoiler"><code>${esc(key)}</code></span>`,
       ``,
+      `<b>Tap the hidden key to reveal it.</b>`,
       `<b>This message deletes itself in 90 seconds.</b>`,
       `Anyone with this key can drain the wallet. Do not share it.`,
       `Import: MetaMask / Rabby / Trust Wallet → "Import account".`,
@@ -1594,7 +1605,7 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
     pendingExports.delete(requester);
     await ctx.answerCallbackQuery({ text: 'Cancelled' });
     try {
-      await ctx.editMessageText('<b>Export cancelled.</b> No key was sent.', {
+      await ctx.editMessageText('✖️ <b>Export cancelled.</b> No key was sent.', {
         parse_mode: 'HTML',
       });
     } catch {
@@ -1709,7 +1720,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
     withdrawDrafts.delete(userId);
     await ctx.answerCallbackQuery({ text: 'Cancelled' });
     try {
-      await ctx.editMessageText('<b>Withdrawal cancelled.</b> Nothing was sent.', {
+      await ctx.editMessageText('✖️ <b>Withdrawal cancelled.</b> Nothing was sent.', {
         parse_mode: 'HTML',
       });
     } catch {
@@ -1733,7 +1744,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
 
   await ctx.answerCallbackQuery({ text: 'Sending…' });
   try {
-    await ctx.editMessageText('<b>Sending USDT…</b>', { parse_mode: 'HTML' }).catch(() => {});
+    await ctx.editMessageText('⏳ <b>Sending USDT…</b>', { parse_mode: 'HTML' }).catch(() => {});
   } catch {
     // ignore
   }
@@ -1802,7 +1813,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
 
   if (text.toLowerCase() === 'cancel') {
     withdrawDrafts.delete(userId);
-    await ctx.reply('<b>Withdrawal cancelled.</b> Nothing was sent.', {
+    await ctx.reply('✖️ <b>Withdrawal cancelled.</b> Nothing was sent.', {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -1825,7 +1836,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
         '✅ <b>Destination saved</b>',
         `<code>${addr}</code>`,
         ``,
-        '<b>Step 2 of 2 · Amount</b>',
+        '💵 <b>Step 2 of 2 · Amount</b>',
         'How much USDT should be sent?',
         'Type a number like <code>10</code>, or <code>all</code> for the full balance.',
         ``,
@@ -1886,7 +1897,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     .text('❌ Cancel', 'w:no');
   await ctx.reply(
     [
-      `<b>Confirm withdrawal</b>`,
+      `💸 <b>Confirm withdrawal</b>`,
       ``,
       `Amount    <b>${amountStr} USDT</b>`,
       `To        <code>${draft.address}</code>`,
@@ -1965,7 +1976,7 @@ async function inlineBetSide(ctx: Context, raw: string) {
   betDraft.set(userId, { outcome: side });
   await ctx.answerCallbackQuery();
   const price = side === 'UP' ? round.upPrice : round.downPrice;
-  await ctx.editMessageText(`<b>${side}</b> at ${(price * 100).toFixed(0)}¢\nChoose an amount.`, {
+  await ctx.editMessageText(`🎯 <b>${side}</b> at ${(price * 100).toFixed(0)}¢\nChoose an amount.`, {
     parse_mode: 'HTML',
     reply_markup: buildAmountInline(side),
   });
@@ -2049,13 +2060,13 @@ export async function handleOrders(ctx: Context) {
   }
 
   if (orders.length === 0) {
-    return ctx.reply('No resting orders.', { reply_markup: mainKb(ctx) });
+    return ctx.reply('📭 No resting orders.', { reply_markup: mainKb(ctx) });
   }
 
   pruneOrderCache();
   const shown = orders.slice(0, 8);
   const kb = new InlineKeyboard();
-  const lines = ['<b>Resting orders</b>', '<i>Unfilled orders waiting on the book.</i>', ''];
+  const lines = ['📋 <b>Resting orders</b>', '<i>Unfilled orders waiting on the book.</i>', ''];
   for (const o of shown) {
     const key = crypto.randomBytes(5).toString('hex');
     orderCache.set(key, { chatId, userId, orderId: o.id, expires: Date.now() + ORDER_CACHE_TTL_MS });
@@ -2066,7 +2077,7 @@ export async function handleOrders(ctx: Context) {
   }
   if (orders.length > shown.length) lines.push('', `+${orders.length - shown.length} more`);
   if (orders.length > 1) kb.text('Cancel all', 'o:a').row();
-  kb.text('Refresh', 'o:l');
+  kb.text('🔄 Refresh', 'o:l');
 
   await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: kb });
 }
@@ -2135,7 +2146,7 @@ export async function handleOrderbook(ctx: Context) {
 
   const lockKnown = round.lockPrice > 0;
   const header = [
-    `<b>Book</b>  ·  ${esc(round.title)}`,
+    `📖 <b>Book</b>  ·  ${esc(round.title)}`,
     lockKnown
       ? `BTC ${round.priceDiff >= 0 ? '+' : '-'}$${Math.abs(round.priceDiff).toFixed(2)} vs lock ($${round.lockPrice.toFixed(2)} → $${round.currentPrice.toFixed(2)})`
       : `Lock price syncing… now $${round.currentPrice.toFixed(2)}`,
@@ -2158,7 +2169,7 @@ export async function handleOrderbook(ctx: Context) {
       const asks = book.asks.slice(0, 3).map(fmt).reverse();
       const bids = book.bids.slice(0, 3).map(fmt);
       return [
-        `<b>${title}</b>`,
+        `${title === 'UP' ? '🟢' : '🔴'} <b>${title}</b>`,
         '<pre>' +
           [...(asks.length ? asks.map((l) => `ask ${l}`) : ['ask  none']), ...(bids.length ? bids.map((l) => `bid ${l}`) : ['bid  none'])].join('\n') +
           '</pre>',
@@ -2185,21 +2196,21 @@ async function handlePauseToggle(ctx: Context) {
   setNotifyPaused(chatId, next);
   await ctx.reply(
     next
-      ? '<b>Alerts muted.</b> Tap Unmute alerts anytime.'
-      : '<b>Alerts on.</b>',
-    { parse_mode: 'HTML', reply_markup: buildMainKeyboard(next) }
+      ? '🔕 <b>Alerts muted.</b>\n<i>Turn them back on from 👤 Profile.</i>'
+      : '🔔 <b>Alerts on.</b>',
+    { parse_mode: 'HTML', reply_markup: profileKb(ctx) }
   );
 }
 
 async function startQuickBet(ctx: Context) {
   const round = roundWatcher.getCurrentRound();
   if (!round) {
-    return ctx.reply('No active round yet. Tap Live in a moment.', {
+    return ctx.reply('⏳ No active round yet. Tap 📈 Live in a moment.', {
       reply_markup: mainKb(ctx),
     });
   }
   if (round.isLocked) {
-    return ctx.reply('Round locked — wait for the next round.', {
+    return ctx.reply('🔒 Round locked — wait for the next round.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -2207,7 +2218,7 @@ async function startQuickBet(ctx: Context) {
     betDraft.set(ctx.from.id, {});
   }
   forgetMainMenu(ctx);
-  await ctx.reply('<b>Quick bet</b>: pick a side.', {
+  await ctx.reply('⚡ <b>Quick bet</b>: pick a side.', {
     parse_mode: 'HTML',
     reply_markup: buildSideKeyboard(),
   });
@@ -2342,7 +2353,7 @@ export async function handleTextMessage(ctx: Context) {
     case BTN.OPEN:
       return handlePositions(ctx);
     case BTN.LOG:
-      return handleHistory(ctx);
+      return handleHistory(ctx, true);
     case BTN.TREND:
       return handleOrderbook(ctx);
     case BTN.ORDERS:
@@ -2351,14 +2362,14 @@ export async function handleTextMessage(ctx: Context) {
       return startQuickBet(ctx);
     case BTN.PNL:
       return handleStats(ctx);
-    case BTN.SETTINGS:
+    case BTN.PROFILE:
       return handleSettings(ctx);
     case BTN.EXPORT_KEY:
       return handleExport(ctx);
     case BTN.WITHDRAW:
       return handleWithdraw(ctx);
     case BTN.HELP:
-      return handleHelp(ctx);
+      return handleHelp(ctx, true);
     case BTN.PAUSE:
     case BTN.RESUME:
       return handlePauseToggle(ctx);

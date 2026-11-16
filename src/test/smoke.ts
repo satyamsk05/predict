@@ -193,22 +193,24 @@ check('empty side on UP means the opposite DOWN side is empty', () => {
 
 console.log('menu');
 check('main keyboard buttons are all routable', () => {
-  const rows = buildMainKeyboard(false).keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
-  assert.equal(rows.length, 10);
+  const rows = buildMainKeyboard().keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
+  assert.equal(rows.length, 8);
   for (const t of rows) assert.ok(MAIN_BTN_SET.has(t), t);
-  assert.ok(rows.includes(BTN.SETTINGS));
-  const muted = buildMainKeyboard(true).keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
-  assert.ok(muted.includes(BTN.RESUME) && !muted.includes(BTN.PAUSE));
+  assert.ok(rows.includes(BTN.PROFILE));
+  assert.ok(!rows.includes(BTN.LOG) && !rows.includes(BTN.PAUSE));
 });
 check('labels from the previous keyboard still map to a current label', () => {
   for (const [old, now] of Object.entries(LEGACY_BTN)) {
     assert.ok(now === '/help' || Object.values(BTN).includes(now as any), old);
   }
 });
-check('settings keyboard buttons are all routable', () => {
+check('profile keyboard buttons are all routable', () => {
   const rows = buildSettingsKeyboard().keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
   for (const t of rows) assert.ok(SETTINGS_BTN_SET.has(t), t);
   assert.ok(rows.includes(BTN.EXPORT_KEY) && rows.includes(BTN.BACK));
+  assert.ok(rows.includes(BTN.LOG) && rows.includes(BTN.PAUSE));
+  const muted = buildSettingsKeyboard(true).keyboard.flat().map((b: any) => (typeof b === 'string' ? b : b.text));
+  assert.ok(muted.includes(BTN.RESUME) && !muted.includes(BTN.PAUSE));
 });
 check('round card: compact, no raw HTML specials, lock/test notices', () => {
   const card = buildRoundCard(
@@ -224,7 +226,7 @@ check('round card: compact, no raw HTML specials, lock/test notices', () => {
   assert.ok(card.includes('1.85x') && card.includes('2.17x'));
   assert.ok(card.includes('Balance  $12.50'));
   assert.ok(!card.includes('━'));
-  assert.ok((card.match(/\p{Extended_Pictographic}/gu) || []).length <= 3);
+  assert.ok((card.match(/\p{Extended_Pictographic}/gu) || []).length <= 10);
 });
 
 console.log(`\n✅ All ${passed} smoke tests passed`);

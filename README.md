@@ -37,7 +37,7 @@ encrypted in `data/accounts.json`; the encryption key comes from
 (**back it up — without it member keys cannot be decrypted**).
 
 Members can:
-- export their own key via ⚙️ Settings → 🔐 Export Key or `/export`
+- export their own key via 👤 Profile → 🔐 Export Key or `/export`
   (private chat only, inline confirm, auto-deletes after 90s)
 - withdraw USDT via 🏦 Wallet → 💸 Withdraw or `/withdraw` (paste address →
   amount or `all` → Confirm → BSCScan TX link)

@@ -48,20 +48,21 @@ export function createBot() {
 
   // Commands
   bot.command('start', handleStart);
-  bot.command('help', handleHelp);
+  bot.command('help', (ctx) => handleHelp(ctx));
   bot.command('up', handleUp);
   bot.command('down', handleDown);
   bot.command('balance', handleBalance);
   bot.command('positions', handlePositions);
   bot.command('pos', handlePositions);
   bot.command('stats', handleStats);
-  bot.command('history', handleHistory);
+  bot.command('history', (ctx) => handleHistory(ctx));
   bot.command('trend', handleOrderbook);
   bot.command('book', handleOrderbook);
   bot.command('orders', handleOrders);
   bot.command('orderbook', handleOrderbook);
   bot.command('reset', handleReset);
   bot.command('export', handleExport);
+  bot.command('profile', handleSettings);
   bot.command('settings', handleSettings);
   bot.command('withdraw', handleWithdraw);
   // Multi-user management — admin-only (no approval: /start auto-creates)
