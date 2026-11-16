@@ -66,7 +66,22 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+/** setInterval does not wait for a slow poll — never run two at once. */
+let polling = false;
+
 async function poll(bot: Bot<Context>) {
+  if (polling) return;
+  polling = true;
+  try {
+    await pollOnce(bot);
+  } catch (e) {
+    logger.warn({ err: e }, 'Deposit poll failed');
+  } finally {
+    polling = false;
+  }
+}
+
+async function pollOnce(bot: Bot<Context>) {
   let changed = false;
 
   for (const userId of userRegistry.activeIds()) {
@@ -93,7 +108,7 @@ async function poll(bot: Bot<Context>) {
 
     const address = rt.api.getEffectiveAddress();
     const lines = [
-      `💰 <b>Funds Received!</b>`,
+      `<b>Funds Received!</b>`,
       ``,
       dUsdt >= MIN_USDT_DELTA ? `USDT: <b>+$${dUsdt.toFixed(2)}</b>` : '',
       dBnb >= MIN_BNB_DELTA ? `BNB: <b>+${dBnb.toFixed(4)}</b>` : '',
@@ -103,7 +118,7 @@ async function poll(bot: Bot<Context>) {
       linkLine(portfolioUrl(address), 'Portfolio on Predict.fun'),
       linkLine(addressUrl(address), 'View on BSCScan'),
       ``,
-      `ℹ️ Deposit ya Predict.fun payout — dono isi tarah dikhte hain.`,
+      `Deposits and Predict.fun payouts both appear this way.`,
     ]
       .filter(Boolean)
       .join('\n');

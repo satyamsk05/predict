@@ -41,6 +41,11 @@ class RiskManager {
   private tradeHistory: TradeRecord[] = [];
   /** `${marketId}|${outcome}` already counted, so polling can't double-count. */
   private settledKeys: Set<string> = new Set();
+  /**
+   * Per-member failed-order streaks. One member's failures (empty wallet, API
+   * rejects) must pause THAT member — not trip the shared breaker for everyone.
+   */
+  private userFailures: Map<number, { count: number; cooldownUntil: number }> = new Map();
 
   constructor() {
     // Restore persisted state so a restart can't silently clear the loss limit.
@@ -92,12 +97,28 @@ class RiskManager {
     }
   }
 
-  public canTrade(amountUsdt: number): { allowed: boolean; reason?: string } {
+  public canTrade(amountUsdt: number, userId?: number): { allowed: boolean; reason?: string } {
     if (this.isTripped) {
       return {
         allowed: false,
         reason: `Circuit Breaker is TRIPPED: ${this.tripReason}`,
       };
+    }
+
+    // NaN passes every `>` / `<=` comparison below, so it must be rejected first.
+    if (!Number.isFinite(amountUsdt)) {
+      return { allowed: false, reason: 'Bet amount must be a valid number' };
+    }
+
+    if (userId != null) {
+      const f = this.userFailures.get(userId);
+      if (f && f.cooldownUntil > Date.now()) {
+        const mins = Math.ceil((f.cooldownUntil - Date.now()) / 60_000);
+        return {
+          allowed: false,
+          reason: `Several recent orders failed. Paused for ${mins} min. Check balance and gas.`,
+        };
+      }
     }
 
     if (amountUsdt > config.trading.maxBetUsdt) {
@@ -136,13 +157,20 @@ class RiskManager {
     this.isTripped = false;
     this.tripReason = '';
     this.consecutiveErrors = 0;
+    this.userFailures.clear();
     logger.info('Circuit breaker manually reset');
     this.persist();
+  }
+
+  /** True when the daily loss limit is still exceeded (a reset won't re-enable trading). */
+  public isDailyLimitExceeded(): boolean {
+    return this.dailyLossUsd >= config.trading.dailyLossLimitUsdt;
   }
 
   public recordTrade(trade: TradeRecord) {
     this.dailyTradesCount++;
     this.consecutiveErrors = 0;
+    if (trade.userId != null) this.userFailures.delete(trade.userId);
     // Defaults so callers don't have to remember the flags.
     trade.filled ??= true;
     trade.dryRun ??= config.trading.dryRun;
@@ -161,7 +189,24 @@ class RiskManager {
     this.persist();
   }
 
-  public recordFailure(error: string) {
+  /**
+   * @param userId the member whose operation failed. When given, the failure only
+   *   pauses that member (10 min after 5 in a row); the shared breaker is left
+   *   alone. Without it (legacy callers) the old global behaviour applies.
+   */
+  public recordFailure(error: string, userId?: number) {
+    if (userId != null) {
+      const f = this.userFailures.get(userId) ?? { count: 0, cooldownUntil: 0 };
+      f.count++;
+      if (f.count >= 5) {
+        f.count = 0;
+        f.cooldownUntil = Date.now() + 10 * 60_000;
+        logger.warn({ userId, error }, 'Member paused for 10 min after 5 consecutive failed orders');
+      }
+      this.userFailures.set(userId, f);
+      return;
+    }
+
     this.consecutiveErrors++;
     if (this.consecutiveErrors >= 5) {
       this.trip(`5 consecutive failed operations: ${error}`);

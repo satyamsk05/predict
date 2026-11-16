@@ -8,6 +8,7 @@ import type { Bot, Context } from 'grammy';
 import type { ActiveRoundState } from '../services/roundWatcher.js';
 import type { PredictPosition } from '../exchanges/predictfun/types.js';
 import { sideOfOutcome } from '../exchanges/predictfun/types.js';
+import { floorShares } from '../exchanges/predictfun/pricing.js';
 import { esc } from '../bot/keyboards.js';
 import { marketUrl, txUrl, linkLine } from '../bot/links.js';
 import { stateStore } from '../utils/store.js';
@@ -26,13 +27,19 @@ const notifyTargets: Map<number, NotifyTarget> = new Map();
 const redeemedKeys: Set<string> = new Set();
 /** Failures already reported, to avoid spamming the chat every minute. */
 const reportedFailures: Set<string> = new Set();
-/** Redeem keys that failed too many times — stopped from retrying forever. */
-const deadRedeems: Set<string> = new Set();
-/** Failure counts per redeem key (for the give-up threshold). */
+/**
+ * Earliest time a failed redeem may be retried. This used to be a permanent
+ * "dead" list after 5 failures — so a winner who simply lacked BNB for gas at
+ * the time never got paid out, even after topping up. Now it only backs off.
+ */
+const redeemRetryAt: Map<string, number> = new Map();
+/** Failure counts per redeem key (drives the backoff). */
 const redeemAttempts: Map<string, number> = new Map();
 let redeemInFlight = false;
-/** Give up on a redeem key after this many failed attempts in one run. */
-const MAX_REDEEM_ATTEMPTS = 5;
+/** Backoff between redeem retries: 2, 4, 8, 16, 32 min, then every 60 min. */
+function redeemBackoffMs(tries: number): number {
+  return Math.min(60, 2 ** Math.min(tries, 6)) * 60_000;
+}
 
 function persistAuto() {
   stateStore.update((s) => {
@@ -183,15 +190,15 @@ export function startAutoServices(bot: Bot<Context>) {
           await bot.api.sendMessage(
             target.chatId,
             [
-              `🔔 <b>New 5M BTC Round Started!</b>`,
+              `<b>New 5M BTC Round Started!</b>`,
               ``,
               `Round: <b>${esc(round.title)}</b>`,
               round.lockPrice > 0
                 ? `Lock Price: <b>$${round.lockPrice.toLocaleString('en-US', { minimumFractionDigits: 2 })}</b>`
-                : `Lock Price: <b>⏳ syncing…</b>`,
+                : `Lock Price: <b>syncing…</b>`,
               `Ends in: <b>${Math.floor(round.secondsRemaining / 60)}:${String(round.secondsRemaining % 60).padStart(2, '0')}</b>`,
               ``,
-              `Tap <b>⚡ Quick Bet</b> or <b>🖥️ Live</b>`,
+              `Tap <b>Quick Bet</b> or <b>Live</b>`,
             ].join('\n'),
             { parse_mode: 'HTML' }
           );
@@ -284,13 +291,13 @@ export function startAutoServices(bot: Bot<Context>) {
                 bot,
                 trade.userId,
                 [
-                  `🧪 <b>[DRY RUN] Settled</b>`,
+                  `<b>[DRY RUN] Settled</b>`,
                   `Market: ${esc(market.title || market.question || marketId)}`,
                   linkLine(marketUrl((market as any).slug), 'Open market'),
                   `Bet: ${trade.outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} $${trade.amountUsdt.toFixed(2)} @ ${(trade.price * 100).toFixed(0)}¢`,
                   `Result: ${result === 'WON' ? '✅ WON' : result === 'LOST' ? '❌ LOST' : '↩️ REFUND'}`,
                   `PnL: <b>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</b>`,
-                  `Today's loss: $${riskManager.getStats().dailyLoss} / $${config.trading.dailyLossLimitUsdt}`,
+                  `Today's loss: $${riskManager.getStats(trade.userId).dailyLoss.toFixed(2)} / $${config.trading.dailyLossLimitUsdt}`,
                 ]
                   .filter(Boolean)
                   .join('\n')
@@ -359,10 +366,12 @@ export function startAutoServices(bot: Bot<Context>) {
 
                 const indexSet = pos.indexSet === '2' ? 2 : 1;
                 const redeemKey = `${userId}|${pos.conditionId}|${indexSet}`;
-                if (redeemedKeys.has(redeemKey) || deadRedeems.has(redeemKey)) continue;
+                if (redeemedKeys.has(redeemKey)) continue;
+                if ((redeemRetryAt.get(redeemKey) ?? 0) > Date.now()) continue;
 
+                // Round DOWN: rounding up can exceed the shares actually held.
                 const amountWei = pos.isNegRisk
-                  ? ethers.parseUnits(pos.shares.toFixed(6), 18)
+                  ? ethers.parseUnits(floorShares(pos.shares), 18)
                   : undefined;
 
                 try {
@@ -388,15 +397,13 @@ export function startAutoServices(bot: Bot<Context>) {
                     const failKey = `redeem|${redeemKey}`;
                     const tries = (redeemAttempts.get(redeemKey) || 0) + 1;
                     redeemAttempts.set(redeemKey, tries);
-                    if (tries >= MAX_REDEEM_ATTEMPTS) {
-                      // Stop burning calls/gas-estimates on a permanently failing
-                      // redeem (e.g. already redeemed externally, no gas).
-                      deadRedeems.add(redeemKey);
-                      logger.warn(
-                        { conditionId: pos.conditionId, tries, userId },
-                        'Auto-redeem gave up after repeated failures'
-                      );
-                    }
+                    // Back off instead of retrying every minute (or never again).
+                    const waitMs = redeemBackoffMs(tries);
+                    redeemRetryAt.set(redeemKey, Date.now() + waitMs);
+                    logger.warn(
+                      { conditionId: pos.conditionId, tries, userId, retryInMin: waitMs / 60_000 },
+                      'Auto-redeem failed — will retry later'
+                    );
                     if (!reportedFailures.has(failKey)) {
                       reportedFailures.add(failKey);
                       logger.warn(
@@ -417,6 +424,8 @@ export function startAutoServices(bot: Bot<Context>) {
                   }
 
                   redeemedKeys.add(redeemKey);
+                  redeemAttempts.delete(redeemKey);
+                  redeemRetryAt.delete(redeemKey);
                   persistAuto();
                   await notifyTradeOwner(
                     bot,

@@ -4,6 +4,7 @@ import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 import { predictFunApi, type PredictFunApi } from './api.js';
 import { outcomeBuyPrice, sideOfOutcome, type PredictMarket } from './types.js';
+import { buyMaxPrice, floorShares, floorPrice, priceDecimals, MIN_SHARES } from './pricing.js';
 
 class PredictSigner {
   private orderBuilder: OrderBuilder | null = null;
@@ -114,7 +115,7 @@ class PredictSigner {
       }
 
       this.approvalsReady.add(cacheKey);
-      logger.info('Protocol approvals are ready (BUY scope)');
+      logger.info(`Protocol approvals are ready (${side === Side.BUY ? 'BUY' : 'SELL'} scope)`);
       return { success: true };
     } catch (e: any) {
       logger.error({ err: e }, 'Failed to set protocol approvals');
@@ -129,9 +130,11 @@ class PredictSigner {
     market: PredictMarket,
     outcome: 'UP' | 'DOWN',
     amountUsdt: number,
-    limitPrice?: number
+    limitPrice?: number,
+    /** When the order must stop resting (the round's end). */
+    expiresAt?: Date
   ): Promise<{ success: boolean; orderId?: string; orderHash?: string; error?: string }> {
-    return this.submitOrder(market, outcome, Side.BUY, { amountUsdt, limitPrice });
+    return this.submitOrder(market, outcome, Side.BUY, { amountUsdt, limitPrice, expiresAt });
   }
 
   /**
@@ -151,7 +154,7 @@ class PredictSigner {
     market: PredictMarket,
     outcome: 'UP' | 'DOWN',
     side: Side,
-    opts: { amountUsdt?: number; shares?: number; limitPrice?: number }
+    opts: { amountUsdt?: number; shares?: number; limitPrice?: number; expiresAt?: Date }
   ): Promise<{ success: boolean; orderId?: string; orderHash?: string; error?: string }> {
     if (!this.orderBuilder) {
       await this.init();
@@ -178,24 +181,34 @@ class PredictSigner {
       }
 
       const tokenId = (targetOutcome.onChainId || targetOutcome.tokenId)!;
-      const price = opts.limitPrice || outcomeBuyPrice(targetOutcome) || 0;
+
+      // An explicit `limitPrice` is the caller's price (user-typed limit, or the
+      // confirm-time cap): it is a HARD CAP. Without one, a BUY is a market
+      // order priced off the live ask plus the slippage budget.
+      const hasExplicitLimit = opts.limitPrice != null && opts.limitPrice > 0;
+      const price = hasExplicitLimit
+        ? (opts.limitPrice as number)
+        : outcomeBuyPrice(targetOutcome) || 0;
       if (!(price > 0) || price >= 1) {
         return {
           success: false,
-          error: `No valid ask price for ${outcome} (got ${price}). Liquidity may be missing.`,
+          error: `No valid ${hasExplicitLimit ? 'limit' : 'ask'} price for ${outcome} (got ${price}). Liquidity may be missing.`,
         };
       }
 
-      // The API accepts at most 2 decimals on pricePerShare (1¢ tick).
-      // BUY: quantize down within the slippage budget, but never below the ask.
+      // pricePerShare may have at most the market's `decimalPrecision` decimals
+      // (we use 2 = 1¢ tick unless the market allows fewer).
       // SELL: quantize down from the bid so the order still crosses.
-      const slip = side === Side.BUY ? Math.max(0, config.trading.slippageBps) / 10000 : 0;
-      const rawPrice = side === Side.BUY ? Math.min(0.99, price * (1 + slip)) : price;
-      const cents = Math.max(1, Math.min(99, Math.floor(rawPrice * 100 + 1e-9)));
-      let maxPrice = cents / 100;
-      if (side === Side.BUY && maxPrice < price) {
-        maxPrice = Math.min(0.99, Math.ceil(price * 100 - 1e-9) / 100);
-      }
+      const decimals = priceDecimals(market.decimalPrecision);
+      const maxPrice =
+        side === Side.BUY
+          ? buyMaxPrice({
+              ask: hasExplicitLimit ? undefined : price,
+              hardCap: hasExplicitLimit ? price : undefined,
+              slippageBps: config.trading.slippageBps,
+              decimals,
+            })
+          : floorPrice(price, decimals);
 
       let quantityWei: bigint;
       if (side === Side.BUY) {
@@ -203,20 +216,20 @@ class PredictSigner {
         if (!(shares > 0)) {
           return { success: false, error: 'Computed share quantity is invalid' };
         }
-        quantityWei = ethers.parseEther(shares.toFixed(6));
+        quantityWei = ethers.parseEther(floorShares(shares));
       } else {
         const shares = opts.shares ?? 0;
         if (!(shares > 0)) {
           return { success: false, error: 'Position has no shares to sell' };
         }
-        quantityWei = ethers.parseEther(shares.toFixed(6));
+        quantityWei = ethers.parseEther(floorShares(shares));
       }
 
-      if (quantityWei <= 0n) {
-        return { success: false, error: 'Order quantity is too small' };
+      if (quantityWei <= 0n || Number(floorShares(Number(ethers.formatEther(quantityWei)))) < MIN_SHARES) {
+        return { success: false, error: `Order too small (minimum ${MIN_SHARES} share)` };
       }
 
-      const priceWei = ethers.parseEther(maxPrice.toFixed(2));
+      const priceWei = ethers.parseEther(maxPrice.toFixed(decimals));
 
       const orderAmounts = this.orderBuilder.getLimitOrderAmounts({
         side,
@@ -233,6 +246,11 @@ class PredictSigner {
         makerAmount: orderAmounts.makerAmount,
         takerAmount: orderAmounts.takerAmount,
         feeRateBps,
+        // LIMIT orders never expire by default (SDK uses a far-future date), so an
+        // unfilled bet would rest on the book after its round. Expire at round end.
+        ...(opts.expiresAt && opts.expiresAt.getTime() > Date.now() + 5_000
+          ? { expiresAt: opts.expiresAt }
+          : {}),
       });
 
       const typedData = this.orderBuilder.buildTypedData(order, {

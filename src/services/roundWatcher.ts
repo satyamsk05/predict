@@ -3,7 +3,11 @@ import { logger } from '../utils/logger.js';
 import { btcPriceService } from './btcPrice.js';
 import { chainlinkPriceService } from './chainlinkPrice.js';
 import { predictFunApi } from '../exchanges/predictfun/api.js';
-import { outcomeBuyPrice, type PredictMarket } from '../exchanges/predictfun/types.js';
+import {
+  outcomeBuyPrice,
+  sideOfOutcome,
+  type PredictMarket,
+} from '../exchanges/predictfun/types.js';
 
 export interface ActiveRoundState {
   marketId: string;
@@ -36,8 +40,8 @@ function bestBtcPrice(): number {
 }
 
 function findOutcome(market: PredictMarket, side: 'UP' | 'DOWN') {
-  const want = side === 'UP' ? ['up', 'yes'] : ['down', 'no'];
-  const byName = market.outcomes?.find((o) => want.includes((o.name || '').toLowerCase()));
+  // Same classifier as settlement/handlers, so every module agrees on sides.
+  const byName = market.outcomes?.find((o) => sideOfOutcome(o.name) === side);
   if (byName) return byName;
   // indexSet 1 = first outcome (Up/Yes), 2 = second (Down/No)
   return market.outcomes?.find((o) => o.indexSet === (side === 'UP' ? 1 : 2));
@@ -87,28 +91,42 @@ class RoundWatcher {
     // If no round or current round has ended, refresh from API.
     // Throttled: without an active round the old code fired one request per
     // second forever during an API outage.
-    if (!this.currentRound || now >= this.currentRound.endsAt) {
-      const waitMs = Math.max(1000, this.refreshBackoffMs);
+    //
+    // A synthetic placeholder (API had no active round yet) must NOT be kept
+    // until its slot ends: the real round usually appears seconds after the
+    // boundary, and sitting on the placeholder skipped the whole 5-minute round.
+    // Keep retrying (throttled) while the placeholder is active.
+    const needsRefresh =
+      !this.currentRound || now >= this.currentRound.endsAt || this.currentRound.synthetic === true;
+    if (needsRefresh) {
+      const waitMs = this.currentRound?.synthetic
+        ? Math.max(3000, this.refreshBackoffMs)
+        : Math.max(1000, this.refreshBackoffMs);
       if (now - this.lastRefreshAttempt >= waitMs) {
         await this.refreshRound();
       }
-      return;
+      // A placeholder still has a live countdown, so keep ticking it below.
+      const after = this.currentRound;
+      if (!after || now >= after.endsAt) return;
+      if (!after.synthetic) return;
     }
+
+    const round = this.currentRound;
+    if (!round) return;
 
     // Update real-time metrics. Before any price source connects the price is
     // 0 — never overwrite the last known price with 0.
     const livePrice = bestBtcPrice();
-    const currentPrice =
-      livePrice > 0 ? livePrice : this.currentRound.currentPrice;
-    const secondsRemaining = Math.max(0, Math.floor((this.currentRound.endsAt - now) / 1000));
+    const currentPrice = livePrice > 0 ? livePrice : round.currentPrice;
+    const secondsRemaining = Math.max(0, Math.floor((round.endsAt - now) / 1000));
     const isLocked = secondsRemaining <= config.trading.lockGuardSeconds;
 
-    const lockPrice = this.currentRound.lockPrice || currentPrice;
+    const lockPrice = round.lockPrice || currentPrice;
     const diff = lockPrice > 0 && currentPrice > 0 ? currentPrice - lockPrice : 0;
     const trend = diff > 0 ? 'UP' : diff < 0 ? 'DOWN' : 'EQUAL';
 
     this.currentRound = {
-      ...this.currentRound,
+      ...round,
       currentPrice,
       priceDiff: diff,
       currentTrend: trend,
@@ -118,7 +136,7 @@ class RoundWatcher {
 
     // Re-check API every 15s for odds, and faster while the lock price is still
     // unknown (right after a round starts the API has no startPrice yet).
-    const lockPending = this.currentRound.lockPrice <= 0;
+    const lockPending = round.lockPrice <= 0;
     if (
       now - this.lastOddsSyncAt >= 15000 ||
       (lockPending && now - this.lastOddsSyncAt >= 3000)
@@ -210,6 +228,10 @@ class RoundWatcher {
       const slotStart = currentSlot * roundDurationMs;
       const slotEnd = slotStart + roundDurationMs;
       const secondsRemaining = Math.max(0, Math.floor((slotEnd - now) / 1000));
+      // Placeholder is retried every few seconds now — only log the first time.
+      const alreadyPlaceholder =
+        this.currentRound?.synthetic === true &&
+        this.currentRound.marketId === `btc-5m-${currentSlot}`;
 
       this.currentRound = {
         marketId: `btc-5m-${currentSlot}`,
@@ -227,7 +249,9 @@ class RoundWatcher {
         isLocked: secondsRemaining <= config.trading.lockGuardSeconds,
         synthetic: true,
       };
-      logger.warn('No active series round — using synthetic placeholder (orders disabled)');
+      if (!alreadyPlaceholder) {
+        logger.warn('No active series round — using synthetic placeholder (orders disabled)');
+      }
       this.consecutiveRefreshFailures = 0;
       this.refreshBackoffMs = 0;
       this.notify();
@@ -248,10 +272,19 @@ class RoundWatcher {
   }
 
   private async syncMarketOdds() {
-    const round = this.currentRound;
-    if (!round?.rawMarket) return;
+    const marketId = this.currentRound?.marketId;
+    if (!marketId || !this.currentRound?.rawMarket) return;
     try {
-      const updated = await predictFunApi.getMarket(round.marketId);
+      const updated = await predictFunApi.getMarket(marketId);
+
+      // tick() replaces `this.currentRound` with a fresh object every second.
+      // The object captured BEFORE the await is therefore usually detached by
+      // the time the response arrives, and writing to it silently dropped the
+      // new odds / lock price / market data (stale prices on every bet).
+      // Re-read the live object, and bail out if the round rolled over.
+      const round = this.currentRound;
+      if (!round || round.marketId !== marketId) return;
+
       if (updated?.outcomes?.length) {
         const up = findOutcome(updated, 'UP');
         const down = findOutcome(updated, 'DOWN');

@@ -3,6 +3,7 @@ import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 import { getProvider } from '../../utils/provider.js';
 import type {
+  OpenOrder,
   PredictMarket,
   PredictOrderbook,
   PredictPosition,
@@ -14,6 +15,34 @@ const HTTP_TIMEOUT_MS = 15_000;
 
 function timeoutSignal(ms = HTTP_TIMEOUT_MS): AbortSignal {
   return AbortSignal.timeout(ms);
+}
+
+/**
+ * fetch + rate-limit handling. The API answers 429 *without* processing the
+ * request and without Retry-After; `RateLimit-Reset` (seconds) says when the
+ * window reopens. Because a 429 request was never processed, retrying is safe
+ * for POSTs too. The signal is rebuilt per attempt so each try gets a full timeout.
+ */
+const MAX_429_RETRIES = 2;
+const MAX_429_WAIT_MS = 10_000;
+
+async function apiFetch(
+  url: string,
+  init: Omit<RequestInit, 'signal'> & { timeoutMs?: number } = {}
+): Promise<Response> {
+  const { timeoutMs, ...rest } = init;
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { ...rest, signal: timeoutSignal(timeoutMs) });
+    if (res.status !== 429 || attempt >= MAX_429_RETRIES) return res;
+    const reset = Number(res.headers.get('ratelimit-reset'));
+    const waitMs = Math.min(
+      MAX_429_WAIT_MS,
+      (Number.isFinite(reset) && reset > 0 ? reset * 1000 : 1000 * (attempt + 1)) +
+        Math.floor(Math.random() * 300)
+    );
+    logger.warn({ url: url.split('?')[0], waitMs, attempt: attempt + 1 }, 'Predict.fun rate limit (429) — waiting');
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
 }
 
 /** API returns share amounts sometimes in wei, sometimes as decimal shares. */
@@ -108,6 +137,8 @@ class PredictFunApi {
   private jwtExpiresAt: number = 0;
   private wallet: Wallet | null = null;
   private authFailUntil: number = 0;
+  /** Shared in-flight auth so concurrent callers don't each sign + POST /auth. */
+  private jwtInFlight: Promise<string> | null = null;
   /** Optional Predict Account (smart wallet). Per-user instances are EOA-only. */
   private predictAccount: string | undefined;
 
@@ -164,15 +195,26 @@ class PredictFunApi {
   /**
    * Fetch and renew JWT if needed (valid for 24 hours, refreshed at 23 hours)
    */
-  public async getValidJwt(): Promise<string> {
+  public getValidJwt(): Promise<string> {
     if (this.jwtToken && Date.now() < this.jwtExpiresAt - 60 * 60 * 1000) {
-      return this.jwtToken;
+      return Promise.resolve(this.jwtToken);
     }
 
     if (Date.now() < this.authFailUntil) {
-      throw new Error('Predict.fun auth temporarily paused after recent failure');
+      return Promise.reject(
+        new Error('Predict.fun auth temporarily paused after recent failure')
+      );
     }
 
+    if (!this.jwtInFlight) {
+      this.jwtInFlight = this.authenticate().finally(() => {
+        this.jwtInFlight = null;
+      });
+    }
+    return this.jwtInFlight;
+  }
+
+  private async authenticate(): Promise<string> {
     if (!this.wallet) {
       throw new Error('PREDICTFUN_PRIVATE_KEY not configured or invalid');
     }
@@ -183,9 +225,8 @@ class PredictFunApi {
 
     try {
       logger.info('Authenticating with Predict.fun API to get JWT...');
-      const msgRes = await fetch(`${config.predictfun.baseUrl}/auth/message`, {
+      const msgRes = await apiFetch(`${config.predictfun.baseUrl}/auth/message`, {
         headers: this.apiHeaders(),
-        signal: timeoutSignal(),
       });
 
       if (!msgRes.ok) {
@@ -224,7 +265,7 @@ class PredictFunApi {
       }
 
       // API expects `signer`, NOT `address`
-      const authRes = await fetch(`${config.predictfun.baseUrl}/auth`, {
+      const authRes = await apiFetch(`${config.predictfun.baseUrl}/auth`, {
         method: 'POST',
         headers: this.apiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
@@ -232,7 +273,6 @@ class PredictFunApi {
           message,
           signature,
         }),
-        signal: timeoutSignal(),
       });
 
       const authText = await authRes.text();
@@ -280,9 +320,8 @@ class PredictFunApi {
       url.searchParams.set('status', 'ACTIVE');
       url.searchParams.set('first', '5');
 
-      const res = await fetch(url.toString(), {
+      const res = await apiFetch(url.toString(), {
         headers: this.apiHeaders(),
-        signal: timeoutSignal(),
       });
       if (!res.ok) {
         const body = await res.text();
@@ -325,9 +364,8 @@ class PredictFunApi {
         url.searchParams.set('query', query);
       }
 
-      const res = await fetch(url.toString(), {
+      const res = await apiFetch(url.toString(), {
         headers: this.apiHeaders(),
-        signal: timeoutSignal(),
       });
 
       if (!res.ok) {
@@ -353,9 +391,8 @@ class PredictFunApi {
    */
   public async getMarket(marketId: string): Promise<PredictMarket | null> {
     try {
-      const res = await fetch(`${config.predictfun.baseUrl}/markets/${marketId}`, {
+      const res = await apiFetch(`${config.predictfun.baseUrl}/markets/${encodeURIComponent(marketId)}`, {
         headers: this.apiHeaders(),
-        signal: timeoutSignal(),
       });
 
       if (!res.ok) return null;
@@ -372,9 +409,10 @@ class PredictFunApi {
    */
   public async getOrderbook(marketId: string): Promise<PredictOrderbook | null> {
     try {
-      const res = await fetch(`${config.predictfun.baseUrl}/markets/${marketId}/orderbook`, {
+      const res = await apiFetch(
+        `${config.predictfun.baseUrl}/markets/${encodeURIComponent(marketId)}/orderbook`,
+        {
         headers: this.apiHeaders(),
-        signal: timeoutSignal(),
       });
 
       if (!res.ok) return null;
@@ -387,48 +425,65 @@ class PredictFunApi {
 
   /**
    * Get user positions (JWT). Falls back to public-by-address if auth fails.
+   *
+   * The documented query params are only `first` and `after` (cursor from the
+   * previous response), so paging follows `cursor` and the resolved/open split
+   * is applied client-side from the position's own status fields.
    */
   public async getPositions(opts?: { isResolved?: boolean }): Promise<PredictPosition[]> {
-    const mapList = (rows: any[]): PredictPosition[] =>
-      rows.map(normalizePosition).filter((p): p is PredictPosition => !!p);
+    const MAX_PAGES = 6;
+    const PAGE = '100';
+
+    const fetchAll = async (
+      base: string,
+      headers: Record<string, string>
+    ): Promise<PredictPosition[]> => {
+      const out: PredictPosition[] = [];
+      let after: string | undefined;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const url = new URL(base);
+        url.searchParams.set('first', PAGE);
+        if (after) url.searchParams.set('after', after);
+        const res = await apiFetch(url.toString(), { headers });
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`positions ${res.status}: ${body.slice(0, 200)}`);
+        }
+        const data = (await res.json()) as { data?: any[]; cursor?: string };
+        const rows = data.data || [];
+        for (const r of rows) {
+          const p = normalizePosition(r);
+          if (p) out.push(p);
+        }
+        // Stop on the last page: no cursor, an unchanged cursor, or a short page.
+        if (!data.cursor || data.cursor === after || rows.length === 0) break;
+        after = data.cursor;
+      }
+      return out;
+    };
+
+    const select = (rows: PredictPosition[]) =>
+      opts?.isResolved === undefined ? rows : rows.filter((p) => !!p.isResolved === opts.isResolved);
 
     try {
       const jwt = await this.getValidJwt();
-      const url = new URL(`${config.predictfun.baseUrl}/positions`);
-      url.searchParams.set('first', '50');
-      if (opts?.isResolved !== undefined) {
-        url.searchParams.set('isResolved', String(opts.isResolved));
-      }
-
-      const res = await fetch(url.toString(), {
-        headers: this.apiHeaders({ Authorization: `Bearer ${jwt}` }),
-        signal: timeoutSignal(),
-      });
-
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error(`positions ${res.status}: ${body.slice(0, 200)}`);
-      }
-      const data = (await res.json()) as { data?: any[] };
-      return mapList(data.data || []);
+      return select(
+        await fetchAll(
+          `${config.predictfun.baseUrl}/positions`,
+          this.apiHeaders({ Authorization: `Bearer ${jwt}` })
+        )
+      );
     } catch (e) {
       // Public fallback by the *funding* address (no JWT)
       const address = this.getEffectiveAddress();
       if (address) {
         try {
-          const url = new URL(`${config.predictfun.baseUrl}/positions/${address}`);
-          url.searchParams.set('first', '50');
-          if (opts?.isResolved !== undefined) {
-            url.searchParams.set('isResolved', String(opts.isResolved));
-          }
-          const res = await fetch(url.toString(), {
-            headers: this.apiHeaders(),
-            signal: timeoutSignal(),
-          });
-          if (res.ok) {
-            const data = (await res.json()) as { data?: any[] };
-            return mapList(data.data || []);
-          }
+          return select(
+            await fetchAll(
+              `${config.predictfun.baseUrl}/positions/${encodeURIComponent(address)}`,
+              this.apiHeaders()
+            )
+          );
         } catch {
           // fall through to the real error
         }
@@ -436,6 +491,100 @@ class PredictFunApi {
       logger.error({ err: e }, 'Failed to fetch user positions');
       // Do not hide auth/network errors behind an empty list — callers need to know.
       throw e;
+    }
+  }
+
+  /**
+   * Resting orders of this wallet (`GET /orders`, default status OPEN).
+   * Needs the JWT; paged with the response `cursor` → `after`.
+   */
+  public async getOpenOrders(): Promise<OpenOrder[]> {
+    const jwt = await this.getValidJwt();
+    const out: OpenOrder[] = [];
+    let after: string | undefined;
+    for (let page = 0; page < 3; page++) {
+      const url = new URL(`${config.predictfun.baseUrl}/orders`);
+      url.searchParams.set('first', '100');
+      url.searchParams.set('status', 'OPEN');
+      if (after) url.searchParams.set('after', after);
+      const res = await apiFetch(url.toString(), {
+        headers: this.apiHeaders({ Authorization: `Bearer ${jwt}` }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`orders ${res.status}: ${body.slice(0, 200)}`);
+      }
+      const data = (await res.json()) as { data?: any[]; cursor?: string };
+      for (const r of data.data || []) {
+        if (!r?.id) continue;
+        const sideRaw = r.order?.side;
+        out.push({
+          id: String(r.id),
+          hash: r.order?.hash ? String(r.order.hash) : undefined,
+          marketId: r.marketId != null ? String(r.marketId) : undefined,
+          tokenId: r.order?.tokenId ? String(r.order.tokenId) : undefined,
+          side: sideRaw === 1 || sideRaw === '1' ? 'SELL' : 'BUY',
+          shares: parseShares(r.amount),
+          filledShares: parseShares(r.amountFilled),
+          makerAmount: r.order?.makerAmount ? String(r.order.makerAmount) : undefined,
+          takerAmount: r.order?.takerAmount ? String(r.order.takerAmount) : undefined,
+          status: String(r.status || 'OPEN').toUpperCase(),
+          raw: r,
+        });
+      }
+      if (!data.cursor || data.cursor === after || !(data.data || []).length) break;
+      after = data.cursor;
+    }
+    return out;
+  }
+
+  /**
+   * Take orders off the book (`POST /orders/remove`, max 100 ids). This is
+   * off-chain only (free, no gas). `rejected` = still inside the market's
+   * removal lock window; `noop` = already filled/removed/cancelled.
+   */
+  public async removeOrders(
+    ids: string[]
+  ): Promise<{ success: boolean; removed: string[]; noop: string[]; rejected: string[]; error?: string }> {
+    const empty = { removed: [], noop: [], rejected: [] } as {
+      removed: string[];
+      noop: string[];
+      rejected: string[];
+    };
+    if (ids.length === 0) return { success: true, ...empty };
+    try {
+      const jwt = await this.getValidJwt();
+      const res = await apiFetch(`${config.predictfun.baseUrl}/orders/remove`, {
+        method: 'POST',
+        headers: this.apiHeaders({
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${jwt}`,
+        }),
+        body: JSON.stringify({ data: { ids: ids.slice(0, 100) } }),
+        timeoutMs: 20_000,
+      });
+      const text = await res.text();
+      let body: any = {};
+      try {
+        body = JSON.parse(text);
+      } catch {
+        // non-JSON
+      }
+      if (!res.ok || body.success === false) {
+        return {
+          success: false,
+          ...empty,
+          error: body.message || body.error || `HTTP ${res.status}: ${text.slice(0, 160)}`,
+        };
+      }
+      return {
+        success: true,
+        removed: Array.isArray(body.removed) ? body.removed.map(String) : [],
+        noop: Array.isArray(body.noop) ? body.noop.map(String) : [],
+        rejected: Array.isArray(body.rejected) ? body.rejected.map(String) : [],
+      };
+    } catch (e: any) {
+      return { success: false, ...empty, error: e?.message || String(e) };
     }
   }
 
@@ -453,15 +602,11 @@ class PredictFunApi {
       const provider = this.wallet.provider;
       if (!provider) return { usdt: 0, bnb: 0, ok: false };
 
-      // Gas always sits on the signing EOA; funds may sit on the Predict Account.
+      // Gas always sits on the signing EOA; funds (USDT) may sit on the
+      // Predict Account. Report the EOA's BNB: that is what pays for gas.
       const fundingAddress = this.getEffectiveAddress() || this.wallet.address;
-      const [bnbBalWei, eoaBalWei] = await Promise.all([
-        provider.getBalance(this.wallet.address),
-        fundingAddress === this.wallet.address
-          ? Promise.resolve(null)
-          : provider.getBalance(fundingAddress).catch(() => null),
-      ]);
-      const bnb = parseFloat(ethers.formatEther(eoaBalWei ?? bnbBalWei));
+      const bnbBalWei = await provider.getBalance(this.wallet.address);
+      const bnb = parseFloat(ethers.formatEther(bnbBalWei));
 
       // Mainnet USDT / Testnet may differ — keep mainnet default
       const usdtAddress = config.predictfun.isTestnet
@@ -472,8 +617,12 @@ class PredictFunApi {
         'function decimals() view returns (uint8)',
       ];
       const usdtContract = new ethers.Contract(usdtAddress, erc20Abi, provider);
+      // A failed balanceOf MUST propagate (-> ok:false). Swallowing it into 0n
+      // made a rate-limited RPC look like an empty wallet: the deposit watcher
+      // then re-announced the whole balance as a fresh "deposit" on recovery.
+      // Only `decimals` may fall back (USDT on BSC is 18).
       const [usdtBalRaw, decimals] = await Promise.all([
-        usdtContract.balanceOf(fundingAddress).catch(() => 0n),
+        usdtContract.balanceOf(fundingAddress),
         usdtContract.decimals().catch(() => 18),
       ]);
 
@@ -490,7 +639,7 @@ class PredictFunApi {
    */
   public async postOrder(payload: any): Promise<{ success: boolean; orderId?: string; orderHash?: string; error?: string }> {
     const send = async (jwt: string) =>
-      fetch(`${config.predictfun.baseUrl}/orders`, {
+      apiFetch(`${config.predictfun.baseUrl}/orders`, {
         method: 'POST',
         headers: this.apiHeaders({
           'Content-Type': 'application/json',
@@ -499,7 +648,7 @@ class PredictFunApi {
         body: JSON.stringify(payload, (_key, value) =>
           typeof value === 'bigint' ? value.toString() : value
         ),
-        signal: timeoutSignal(20_000),
+        timeoutMs: 20_000,
       });
 
     try {
