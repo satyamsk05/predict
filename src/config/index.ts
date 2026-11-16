@@ -106,7 +106,13 @@ export const config: AppConfig = {
     baseUrl: isTestnet
       ? 'https://api-testnet.predict.fun/v1'
       : 'https://api.predict.fun/v1',
-    rpcUrl: process.env.BSC_RPC_URL || 'https://bsc-dataseed.bnbchain.org/',
+    // Default RPC must match the network: a testnet run on the mainnet endpoint
+    // queries the testnet USDT address on the wrong chain.
+    rpcUrl:
+      process.env.BSC_RPC_URL ||
+      (isTestnet
+        ? 'https://data-seed-prebsc-1-s1.bnbchain.org:8545/'
+        : 'https://bsc-dataseed.bnbchain.org/'),
     seriesSlug: process.env.PREDICTFUN_SERIES_SLUG || 'btc-updown-5m',
   },
   trading: {

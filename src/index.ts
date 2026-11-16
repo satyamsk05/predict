@@ -11,6 +11,7 @@ import {
 import { stateStore } from './utils/store.js';
 import { startDepositWatcher } from './services/depositWatcher.js';
 import { userRegistry } from './users/registry.js';
+import { userAccounts } from './users/accounts.js';
 
 /** .env holds the bot token + private key: make sure only the owner can read it. */
 function checkEnvPermissions() {
@@ -35,6 +36,10 @@ async function main() {
   logger.info(`Network: ${config.predictfun.isTestnet ? 'BNB Testnet (97)' : 'BNB Mainnet (56)'}`);
   logger.info(`Max bet: $${config.trading.maxBetUsdt} USDT`);
   logger.info(`Daily loss limit: $${config.trading.dailyLossLimitUsdt} USDT`);
+
+  // Wallet key store: fail fast (before polling starts) if accounts.json is
+  // corrupt or the master key was lost — never run with a broken key store.
+  userAccounts.init();
 
   // Multi-user registry: seeds env admins, loads data/users.json.
   userRegistry.init();
@@ -76,22 +81,48 @@ async function main() {
   // Create Telegram bot
   const bot = createBot();
 
-  // Set bot commands menu
-  await bot.api.setMyCommands([
-    { command: 'start', description: '⚡ Show live BTC 5M round dashboard' },
-    { command: 'up', description: '🟢 Quick BET UP (e.g. /up 10)' },
-    { command: 'down', description: '🔴 Quick BET DOWN (e.g. /down 10)' },
-    { command: 'balance', description: '💼 Check USDT & BNB balance' },
-    { command: 'positions', description: '📋 View open positions' },
-    { command: 'stats', description: '📈 Win/loss stats & daily PnL' },
-    { command: 'history', description: '📜 Last 10 trades' },
-    { command: 'trend', description: '📈 Orderbook / trend' },
-    { command: 'reset', description: '🔄 Reset circuit breaker (admin)' },
-    { command: 'export', description: '🔑 Export YOUR wallet private key' },
-    { command: 'withdraw', description: '💸 Withdraw USDT to another wallet' },
-    { command: 'users', description: '👥 Member list (admin)' },
-    { command: 'help', description: '❓ Show help' },
-  ]);
+  // Command menu: members see the everyday commands; admins also get the
+  // admin ones, scoped to their own chat so members never see them.
+  const memberCommands = [
+    { command: 'start', description: 'Live round' },
+    { command: 'up', description: 'Bet UP, e.g. /up 10' },
+    { command: 'down', description: 'Bet DOWN, e.g. /down 10' },
+    { command: 'balance', description: 'Wallet balance' },
+    { command: 'positions', description: 'Open positions' },
+    { command: 'orders', description: 'Resting orders, cancel' },
+    { command: 'history', description: 'Recent trades' },
+    { command: 'stats', description: 'PnL and win rate' },
+    { command: 'book', description: 'Order book' },
+    { command: 'withdraw', description: 'Withdraw USDT' },
+    { command: 'export', description: 'Export your private key' },
+    { command: 'help', description: 'Help' },
+  ];
+  await bot.api.setMyCommands(memberCommands);
+  for (const id of userRegistry.activeIds()) {
+    if (!userRegistry.isAdmin(id)) continue;
+    await bot.api
+      .setMyCommands(
+        [
+          ...memberCommands,
+          { command: 'users', description: 'Members (admin)' },
+          { command: 'kick', description: 'Block a member (admin)' },
+          { command: 'unban', description: 'Restore a member (admin)' },
+          { command: 'reset', description: 'Reset circuit breaker (admin)' },
+        ],
+        { scope: { type: 'chat', chat_id: id } }
+      )
+      .catch((e) => logger.warn({ err: e, id }, 'Could not set admin commands'));
+  }
+  // First-open screen and menu button (all best-effort cosmetics).
+  await bot.api
+    .setMyShortDescription('Trade BTC 5-minute up/down markets on Predict.fun.')
+    .catch(() => {});
+  await bot.api
+    .setMyDescription(
+      'Trade BTC 5-minute up/down markets on Predict.fun from Telegram. Your own wallet, one tap to bet, positions and payouts handled for you. Send /start to begin.'
+    )
+    .catch(() => {});
+  await bot.api.setChatMenuButton({ menu_button: { type: 'commands' } }).catch(() => {});
 
   // Restore persisted chats / redeemed markers before starting services.
   restoreAutoState();

@@ -8,8 +8,9 @@ export type TradeSide = 'UP' | 'DOWN';
 export function sideOfOutcome(name?: string | null): TradeSide | null {
   const n = (name || '').trim().toLowerCase();
   if (!n) return null;
-  if (n.includes('up') || n.includes('yes')) return 'UP';
-  if (n.includes('down') || n.includes('no')) return 'DOWN';
+  // Whole words only: a substring test would read "unknown"/"north" as DOWN.
+  if (/\b(up|yes)\b/.test(n)) return 'UP';
+  if (/\b(down|no)\b/.test(n)) return 'DOWN';
   return null;
 }
 
@@ -123,4 +124,20 @@ export function outcomeBuyPrice(outcome?: PredictMarketOutcome | null): number |
   if (outcome.bestAsk?.price && outcome.bestAsk.price > 0) return outcome.bestAsk.price;
   if (typeof outcome.price === 'number' && outcome.price > 0) return outcome.price;
   return undefined;
+}
+
+/** A resting order from `GET /orders` (status OPEN). */
+export interface OpenOrder {
+  id: string;
+  hash?: string;
+  marketId?: string;
+  tokenId?: string;
+  side: 'BUY' | 'SELL';
+  /** Order size / settled part, in shares. */
+  shares: number;
+  filledShares: number;
+  makerAmount?: string;
+  takerAmount?: string;
+  status: string;
+  raw?: unknown;
 }

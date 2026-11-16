@@ -11,8 +11,11 @@ import { riskManager } from '../execution/risk.js';
 import {
   BTN,
   MAIN_BTN_SET,
+  LEGACY_BTN,
   esc,
   buildRoundCard,
+  buildRoundInline,
+  buildAmountInline,
   buildMainKeyboard,
   buildSideKeyboard,
   buildAmountKeyboard,
@@ -23,9 +26,12 @@ import {
 } from './keyboards.js';
 import {
   sideOfOutcome,
+  outcomeBuyPrice,
+  type OpenOrder,
   type PredictMarket,
   type PredictPosition,
 } from '../exchanges/predictfun/types.js';
+import { marketOrderCap, priceDecimals } from '../exchanges/predictfun/pricing.js';
 import {
   registerNotifyTarget,
   unregisterNotifyTarget,
@@ -33,6 +39,7 @@ import {
   isNotifyPaused,
 } from '../services/autoServices.js';
 import { parseBetText } from './betText.js';
+import { splitBooks } from '../exchanges/predictfun/book.js';
 import { marketUrl, portfolioUrl, addressUrl, txUrl, linkLine } from './links.js';
 import { userRegistry } from '../users/registry.js';
 import { userAccounts } from '../users/accounts.js';
@@ -45,6 +52,8 @@ type BetDraft = {
   limitPrice?: number;
   /** Pinned market id: a confirmed bet must never roll into the next round. */
   marketId?: string;
+  /** Price the confirm card showed. A market bet must not silently pay more than this. */
+  quotedPrice?: number;
   awaitingCustom?: boolean;
 };
 
@@ -62,8 +71,19 @@ const ORDER_THROTTLE_MS = 3_000;
  * Withdrawal flow state: 🏦 Wallet → 💸 Withdraw → paste address → amount
  * (or `all`) → inline Confirm → USDT sent + BSCScan link.
  */
-type WithdrawDraft = { address?: string; amount?: 'all' | number };
+type WithdrawDraft = { address?: string; amount?: 'all' | number; at: number };
 const withdrawDrafts: Map<number, WithdrawDraft> = new Map();
+/** A half-finished withdrawal must not stay armed for days (e.g. a hijacked session). */
+const WITHDRAW_DRAFT_TTL_MS = 10 * 60 * 1000;
+
+function getWithdrawDraft(userId: number): WithdrawDraft | undefined {
+  const d = withdrawDrafts.get(userId);
+  if (d && Date.now() - d.at > WITHDRAW_DRAFT_TTL_MS) {
+    withdrawDrafts.delete(userId);
+    return undefined;
+  }
+  return d;
+}
 /** Prevents a double-tapped Confirm from broadcasting two transfers. */
 const WITHDRAW_IN_FLIGHT: Set<number> = new Set();
 
@@ -168,16 +188,16 @@ async function notAllowed(ctx: Context) {
   if (result === 'active') return; // approved in the meantime
   if (result === 'blocked') {
     return ctx.reply(
-      '⛔ <b>Access removed hai.</b>\nAdmin se contact karo agar access wapas chahiye.',
+      '<b>Access removed.</b>\nContact the admin if you need access again.',
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
     );
   }
   if (result === 'denied') {
     return ctx.reply(
       [
-        '🔒 <b>Invite-only bot</b>',
+        '<b>Invite-only bot</b>',
         ``,
-        `Owner se invite code lo, phir ye bhejo:`,
+        `Ask the owner for an invite code, then send:`,
         `<code>/start YOUR_CODE</code>`,
       ].join('\n'),
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
@@ -185,10 +205,10 @@ async function notAllowed(ctx: Context) {
   }
   return ctx.reply(
     [
-      '⛔ <b>Bot full hai</b>',
+      '<b>Bot is full</b>',
       ``,
       `Is bot par max <b>${userRegistry.maxUsers()} members</b> allowed hain aur sab slots bhar chuke hain.`,
-      `Owner se contact karo agar koi slot khulwana hai.`,
+      `Contact the owner if you need a slot.`,
     ].join('\n'),
     { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
   );
@@ -207,7 +227,7 @@ function adminGate(ctx: Context): boolean {
 
 async function adminDenied(ctx: Context) {
   return ctx.reply(
-    '⛔ <b>Admin only.</b>\nApna Telegram id <code>TELEGRAM_ALLOWED_USERS</code> mein set karo.',
+    '<b>Admin only.</b>\nAdd your Telegram id to <code>TELEGRAM_ALLOWED_USERS</code>.',
     { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
   );
 }
@@ -225,18 +245,18 @@ export async function handleUsers(ctx: Context) {
     '',
   ];
   for (const u of admins) {
-    lines.push(`👑 ${u.username ? '@' + u.username : 'admin'} — <code>${u.telegramId}</code>`);
+    lines.push(`${u.username ? '@' + u.username : 'admin'} — <code>${u.telegramId}</code>`);
   }
   for (const u of members) {
     const s = userRegistry.getStats(u.telegramId);
-    const tag = u.status === 'blocked' ? '🚫 blocked' : u.status === 'pending' ? '⏳ pending' : '✅';
+    const tag = u.status === 'blocked' ? 'blocked' : u.status === 'pending' ? 'pending' : '✅';
     lines.push(
       `${tag} ${u.username ? '@' + u.username : 'anon'} (<code>${u.telegramId}</code>) — ` +
         `${s.trades} trades · PnL ${s.pnlUsd >= 0 ? '+' : ''}$${s.pnlUsd.toFixed(2)}`
     );
   }
   if (userRegistry.joinCodeRequired()) {
-    lines.push('', '🔒 Invite code required for new members.');
+    lines.push('', 'Invite code required for new members.');
   }
   lines.push('', `/kick &lt;id&gt; — block member · /unban &lt;id&gt; — restore access`);
   await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
@@ -255,10 +275,10 @@ export async function handleKick(ctx: Context) {
 
   const result = userRegistry.kick(id);
   if (result === 'admin') {
-    return ctx.reply('👑 Admin ko kick nahi kar sakte.', { reply_markup: mainKb(ctx) });
+    return ctx.reply('Admins cannot be kicked.', { reply_markup: mainKb(ctx) });
   }
   if (result === 'notfound') {
-    return ctx.reply(`❌ <code>${id}</code> registry mein nahi mila.`, {
+    return ctx.reply(`<code>${id}</code> not found.`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -267,11 +287,11 @@ export async function handleKick(ctx: Context) {
   dropUserRuntime(id);
   unregisterNotifyTarget(id);
 
-  await ctx.reply(`🚫 <code>${id}</code> ko block kar diya (wallet/funds untouched).`, {
+  await ctx.reply(`<code>${id}</code> blocked (wallet and funds untouched).`, {
     reply_markup: mainKb(ctx),
   });
   await ctx.api
-    .sendMessage(id, 'ℹ️ Tumhara is bot ka access admin ne remove kar diya hai.')
+    .sendMessage(id, 'Your access to this bot was removed by the admin.')
     .catch(() => {});
 }
 
@@ -288,23 +308,29 @@ export async function handleUnban(ctx: Context) {
 
   const result = userRegistry.unban(id);
   if (result === 'admin') {
-    return ctx.reply('👑 Admin hamesha active hota hai.');
+    return ctx.reply('Admins are always active.');
   }
   if (result === 'notfound') {
-    return ctx.reply(`❌ <code>${id}</code> registry mein nahi mila (ya slots full hain).`, {
+    return ctx.reply(`<code>${id}</code> not found.`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
   }
+  if (result === 'full') {
+    return ctx.reply(
+      `All slots are taken. /kick someone first to restore <code>${id}</code>.`,
+      { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+    );
+  }
   if (result === 'notblocked') {
-    return ctx.reply(`ℹ️ <code>${id}</code> blocked nahi hai.`, { reply_markup: mainKb(ctx) });
+    return ctx.reply(`<code>${id}</code> is not blocked.`, { reply_markup: mainKb(ctx) });
   }
 
-  await ctx.reply(`✅ <code>${id}</code> ka access restore kar diya.`, {
+  await ctx.reply(`Access restored for <code>${id}</code>.`, {
     reply_markup: mainKb(ctx),
   });
   await ctx.api
-    .sendMessage(id, '✅ Tumhara access restore kar diya gaya. /start dabao.')
+    .sendMessage(id, 'Your access was restored. Send /start.')
     .catch(() => {});
 }
 
@@ -335,25 +361,25 @@ export async function handleStart(ctx: Context) {
   const { account, created } = userAccounts.ensureAccount(userId, ctx.from?.username);
   if (!account) {
     return ctx.reply(
-      '❌ Wallet create nahi ho paya. Admin se server logs check karwao (WALLET_MASTER_KEY / data folder permissions).',
+      'Could not create your wallet. Ask the admin to check the server logs (WALLET_MASTER_KEY / data folder permissions).',
       { reply_markup: mainKb(ctx) }
     );
   }
 
   if (created) {
     const welcome = [
-      `🎉 <b>Welcome! Aapka trading account ban gaya.</b>`,
+      `<b>Welcome. Your trading account is ready.</b>`,
       ``,
-      `💳 <b>Aapka wallet (sirf aapka):</b>`,
+      `<b>Your wallet</b> (yours alone):`,
       `<code>${account.address}</code>`,
       linkLine(addressUrl(account.address), 'View on BSCScan'),
       ``,
-      `1️⃣ Is address par <b>USDT (BEP-20)</b> + thoda <b>BNB</b> (gas) bhejo.`,
-      `2️⃣ 🏦 Wallet button se balance check karo.`,
-      `3️⃣ ⚡ Quick Bet se BTC 5M up/down trading shuru!`,
+      `1. Send <b>USDT (BEP-20)</b> and a little <b>BNB</b> (gas) to this address.`,
+      `2. Check your balance under Wallet.`,
+      `3. Start trading BTC 5M up/down with Quick bet.`,
       ``,
-      `🔒 Private key encrypted hai — chahiye to <code>/export</code>`,
-      `💸 Withdraw karne ke liye: 🏦 Wallet → 💸 Withdraw`,
+      `Your private key is encrypted. Export it with <code>/export</code>.`,
+      `To withdraw: Wallet → Withdraw.`,
     ].join('\n');
     return ctx.reply(welcome, {
       parse_mode: 'HTML',
@@ -373,15 +399,28 @@ export async function handleStart(ctx: Context) {
     balance = undefined;
   }
 
-  const card = round
-    ? buildRoundCard(round, balance)
-    : '⏳ Loading current BTC 5M round... Try again in a moment.';
+  if (!round) {
+    return ctx.reply('Loading the current BTC 5M round. Try again in a moment.', {
+      reply_markup: mainKb(ctx),
+    });
+  }
 
-  await ctx.reply(card, {
+  // The persistent menu survives in the client; (re)attach it once per chat.
+  const chatId = ctx.chat?.id;
+  if (chatId && !menuShown.has(chatId)) {
+    menuShown.add(chatId);
+    await ctx.reply('Menu ready.', { reply_markup: mainKb(ctx) });
+  }
+
+  await ctx.reply(buildRoundCard(round, balance), {
     parse_mode: 'HTML',
-    reply_markup: mainKb(ctx),
+    reply_markup: buildRoundInline(round),
+    link_preview_options: { is_disabled: true },
   });
 }
+
+/** Chats that already received the persistent menu keyboard in this process. */
+const menuShown: Set<number> = new Set();
 
 // ───────────────────────────────────────────────
 // /help + System
@@ -391,31 +430,29 @@ export async function handleHelp(ctx: Context) {
 
   const stats = riskManager.getStats();
   const help = [
-    '🩺 <b>System</b>',
+    '<b>Help</b>',
     '',
-    '<b>Keyboard:</b>',
-    '🖥️ Live — current round',
-    '🏦 Wallet — USDT / BNB',
-    '📦 Open — open positions',
-    '📜 Log — recent trades',
-    '📈 Trend — orderbook',
-    '⚡ Quick Bet — place a bet',
-    '📊 PnL — stats',
-    '◾ Pause — mute round alerts',
+    'Live · current round, tap UP or DOWN to bet',
+    'Quick bet · pick a side and amount',
+    'Wallet · balance, deposit address, withdraw',
+    'Positions · open positions, close / sell',
+    'Orders · resting orders, cancel',
+    'History · recent trades    PnL · stats',
+    'Book · order book for UP and DOWN',
     '',
-    `<b>DRY RUN:</b> ${config.trading.dryRun ? '✅ Active' : '❌ Off (live)'}`,
-    `<b>Max Bet:</b> $${config.trading.maxBetUsdt}`,
-    `<b>Daily Loss Limit:</b> $${config.trading.dailyLossLimitUsdt}`,
-    `<b>Circuit:</b> ${stats.isTripped ? '🚨 TRIPPED' : '✅ Armed'}`,
+    '<b>Type a bet</b>',
+    '<code>up 5</code>  $5 on UP at market',
+    '<code>down 2 60</code>  $2 on DOWN, limit 60¢',
     '',
-    'Commands still work: /up 10 · /down 10 · /export · /withdraw',
-    ...(adminGate(ctx) ? ['Admin: /users · /kick <id> · /unban <id> · /reset'] : []),
+    '<b>Commands</b>',
+    '/up 10 · /down 10 · /orders · /export · /withdraw',
+    // `<id>` must be escaped: HTML parse mode rejects unknown tags.
+    ...(adminGate(ctx) ? ['Admin: /users · /kick &lt;id&gt; · /unban &lt;id&gt; · /reset'] : []),
     '',
-    '<b>⚡ Fast typing:</b>',
-    '<code>up 5 45</code> → $5 UP @ 45¢ (limit)',
-    '<code>down 2 60</code> → $2 DOWN @ 60¢',
-    '<code>up 5</code> → $5 UP at market price',
-    '📦 Open → tap a position → <b>Close / Sell</b> to book profit',
+    '<b>System</b>',
+    `Mode: ${config.trading.dryRun ? 'test (no real orders)' : 'live'}`,
+    `Max bet: $${config.trading.maxBetUsdt}    Daily loss limit: $${config.trading.dailyLossLimitUsdt}`,
+    `Circuit breaker: ${stats.isTripped ? 'TRIPPED' : 'armed'}`,
   ].join('\n');
 
   await ctx.reply(help, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
@@ -448,7 +485,7 @@ async function quickBet(
     const raw = parseFloat(priceStr);
     limitPrice = raw < 1 ? raw : raw / 100;
     if (!(limitPrice >= 0.01 && limitPrice <= 0.99)) {
-      return ctx.reply('❌ Price 1¢ se 99¢ ke beech hona chahiye (e.g. 55 = 55¢).', {
+      return ctx.reply('Price must be between 1¢ and 99¢ (e.g. 55 = 55¢).', {
         reply_markup: mainKb(ctx),
       });
     }
@@ -484,14 +521,14 @@ async function showConfirm(
   // A typed bet ("up 5") can reach this card before /start created the wallet.
   const { account } = userAccounts.ensureAccount(userId, ctx.from?.username);
   if (!account) {
-    return ctx.reply('❌ Account wallet create nahi ho paya. Thodi der baad /start try karo.', {
+    return ctx.reply('Could not create your wallet. Try /start again shortly.', {
       reply_markup: mainKb(ctx),
     });
   }
 
   const userCheck = userRegistry.canBet(userId);
   if (!userCheck.allowed) {
-    return ctx.reply(`🚫 <b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
+    return ctx.reply(`<b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -505,14 +542,14 @@ async function showConfirm(
 
   if (round.isLocked) {
     return ctx.reply(
-      `⛔ Round is locked! Less than ${config.trading.lockGuardSeconds}s remaining.\nWait for the next round.`,
+      `Round is locked! Less than ${config.trading.lockGuardSeconds}s remaining.\nWait for the next round.`,
       { reply_markup: mainKb(ctx) }
     );
   }
 
-  const { allowed, reason } = riskManager.canTrade(amountUsdt);
+  const { allowed, reason } = riskManager.canTrade(amountUsdt, userId);
   if (!allowed) {
-    return ctx.reply(`🚫 <b>Trade Blocked</b>\n${esc(reason)}`, {
+    return ctx.reply(`<b>Trade Blocked</b>\n${esc(reason)}`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -521,7 +558,7 @@ async function showConfirm(
   // Order placement needs a synced market in every mode (dry-run included),
   // otherwise the confirm card promises something we cannot execute.
   if (!round.rawMarket) {
-    return ctx.reply('❌ Live market data not synced yet. Wait a few seconds and tap 🖥️ Live.', {
+    return ctx.reply('❌ Live market data not synced yet. Wait a few seconds and tap Live.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -548,10 +585,11 @@ async function showConfirm(
     amountUsdt,
     limitPrice,
     marketId: round.marketId,
+    quotedPrice: price,
   });
 
   const confirmText = [
-    `🎯 <b>Confirm Your Bet</b>`,
+    `<b>Confirm Your Bet</b>`,
     ``,
     `Market: ${esc(round.title)}`,
     `Outcome: ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
@@ -560,14 +598,14 @@ async function showConfirm(
     `Shares: ${shares.toFixed(2)}`,
     `Est. Payout: <b>$${payout.toFixed(2)} USDT</b> (before fees)`,
     `Est. Profit: <b>+$${profit.toFixed(2)} USDT</b> (${((profit / amountUsdt) * 100).toFixed(1)}%)`,
-    feePct > 0 ? `ℹ️ Market fee: ${feePct.toFixed(2)}%` : '',
+    feePct > 0 ? `Market fee: ${feePct.toFixed(2)}%` : '',
     linkLine(marketUrl(round.roundSlug), 'Open market'),
     isLimit
       ? belowMarket
-        ? `⏳ Below market (${(marketPrice * 100).toFixed(0)}¢) — order book mein lagega, fill hone par position banegi.`
-        : `✅ Limit price market ke barabar/upar — turant fill hone chahiye.`
-      : `ℹ️ Marketable order — price move hone par slippage cap (${(config.trading.slippageBps / 100).toFixed(1)}%) tak pay ho sakta hai.`,
-    config.trading.dryRun ? `\n🧪 <b>DRY RUN — No real order</b>` : '',
+        ? `Below market (${(marketPrice * 100).toFixed(0)}¢): it will rest on the book and become a position when filled.`
+        : `Limit is at or above market, so it should fill right away.`
+      : `Market order: may pay up to the ${(config.trading.slippageBps / 100).toFixed(1)}% slippage cap if the price moves.`,
+    config.trading.dryRun ? `\n<b>DRY RUN — No real order</b>` : '',
   ]
     .join('\n')
     .trim();
@@ -591,7 +629,7 @@ export async function handleCallbackQuery(ctx: Context) {
   const chatId = ctx.chat?.id;
 
   if (!isAllowed(ctx)) {
-    await ctx.answerCallbackQuery({ text: '⛔ Not authorized' });
+    await ctx.answerCallbackQuery({ text: 'Not authorized' });
     return;
   }
 
@@ -600,6 +638,24 @@ export async function handleCallbackQuery(ctx: Context) {
     if (await handleExportCallback(ctx, data)) return;
     // Withdraw flow buttons (w:s / w:go / w:no)
     if (await handleWithdrawCallback(ctx, data)) return;
+
+    // Round card: refresh / inline bet flow
+    if (data === 'r:rf') return refreshRoundCard(ctx);
+    if (data.startsWith('b:s:')) return inlineBetSide(ctx, data.slice(4));
+    if (data.startsWith('b:a:')) return inlineBetAmount(ctx, data.slice(4));
+    if (data.startsWith('b:c:')) return inlineBetCustom(ctx, data.slice(4));
+    // Resting orders: list / cancel one / cancel all
+    if (data === 'o:l') {
+      await ctx.answerCallbackQuery();
+      try {
+        await ctx.deleteMessage();
+      } catch {
+        // too old to delete
+      }
+      return handleOrders(ctx);
+    }
+    if (data.startsWith('o:c:')) return cancelOneOrder(ctx, data.slice(4));
+    if (data === 'o:a') return cancelAllOrders(ctx);
 
     if (data === 'p:l') {
       await ctx.answerCallbackQuery();
@@ -622,10 +678,7 @@ export async function handleCallbackQuery(ctx: Context) {
       return closePosition(ctx, data.slice(4));
     }
 
-    await ctx.answerCallbackQuery({
-      text: 'Use the bottom keyboard buttons',
-      show_alert: false,
-    });
+    await ctx.answerCallbackQuery({ text: 'This button has expired', show_alert: false });
   } catch (e: any) {
     logger.error({ err: e, data }, 'Callback handler failed');
     try {
@@ -661,7 +714,7 @@ async function showPositionDetail(ctx: Context, key: string) {
   const chatId = ctx.chat?.id;
 
   if (!cached || cached.chatId !== chatId) {
-    return ctx.reply('⌛ Position list expired — tap 📦 Open again.', {
+    return ctx.reply('⌛ Position list expired — tap Positions again.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -671,14 +724,14 @@ async function showPositionDetail(ctx: Context, key: string) {
   const entry = parseFloat(pos.avgEntryPrice) || 0;
 
   const text = [
-    `📦 <b>Position</b>`,
+    `<b>Position</b>`,
     ``,
     `Market: ${esc(pos.marketTitle || pos.marketId)}`,
     linkLine(marketUrl(pos.slug), 'Open market'),
     `Outcome: ${outcomeToSide(pos.outcome) === 'UP' ? '🟢 UP' : '🔴 DOWN'}`,
     `Shares: <b>${pos.shares.toFixed(4)}</b>`,
     entry > 0 ? `Entry: ${(entry * 100).toFixed(1)}¢` : '',
-    bid != null ? `Sell now (best bid): <b>${(bid * 100).toFixed(1)}¢</b>` : '⏳ No buyer right now',
+    bid != null ? `Sell now (best bid): <b>${(bid * 100).toFixed(1)}¢</b>` : 'No buyer right now',
     ...(bid != null
       ? (() => {
           const q = positionPnl(pos, bid);
@@ -690,8 +743,8 @@ async function showPositionDetail(ctx: Context, key: string) {
       : []),
     ``,
     bid != null
-      ? '🔴 <b>Close / Sell</b> dabao → profit book ho jayega (before fees).'
-      : 'Bid aane ka wait karo, phir close kar sakte ho.',
+      ? 'Tap <b>Close / Sell</b> to book the result (before fees).'
+      : 'No bid yet. You can close once one appears.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -707,7 +760,7 @@ async function closePosition(ctx: Context, key: string) {
   const chatId = ctx.chat?.id;
 
   if (!cached || cached.chatId !== chatId) {
-    return ctx.reply('⌛ Position list expired — tap 📦 Open again.', {
+    return ctx.reply('⌛ Position list expired — tap Positions again.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -715,14 +768,14 @@ async function closePosition(ctx: Context, key: string) {
   const pos = cached.position;
   if (pos.isResolved || pos.isSettled) {
     return ctx.editMessageText(
-      '✅ Ye position already resolve ho chuki hai — auto-redeem handle karega.',
+      'This position is already resolved. Auto-redeem will handle it.',
       { reply_markup: buildPositionActionsInline(key) }
     );
   }
 
   const side = outcomeToSide(pos.outcome);
   if (!side) {
-    return ctx.editMessageText('❌ Position ka outcome samajh nahi aaya.', {
+    return ctx.editMessageText('Could not read the outcome of this position.', {
       reply_markup: buildPositionActionsInline(key),
     });
   }
@@ -730,7 +783,7 @@ async function closePosition(ctx: Context, key: string) {
   const { market, bid } = await getPositionQuote(pos);
   if (!market || bid == null) {
     return ctx.editMessageText(
-      '⚠️ Abhi koi buyer (bid) nahi hai — thodi der baad try karo.',
+      'No bids right now. Try again shortly.',
       { reply_markup: buildPositionActionsInline(key) }
     );
   }
@@ -738,23 +791,38 @@ async function closePosition(ctx: Context, key: string) {
   const owner = ctx.from?.id;
   const rt = owner ? getUserRuntime(owner) : null;
   if (!rt) {
-    return ctx.editMessageText('❌ Account wallet load nahi hua — thodi der baad try karo.', {
+    return ctx.editMessageText('Could not load your wallet. Try again shortly.', {
       reply_markup: buildPositionActionsInline(key),
     });
   }
 
   const q = positionPnl(pos, bid);
 
+  // DRY RUN must never touch real money. Positions come from the live API, so
+  // a wallet that holds real shares would otherwise place a REAL sell here.
+  if (config.trading.dryRun) {
+    return ctx.editMessageText(
+      [
+        `<b>[TEST MODE]</b> Sell simulated. No real order was sent.`,
+        ``,
+        `Would sell: ${pos.shares.toFixed(4)} ${side} @ ${(bid * 100).toFixed(0)}¢`,
+        `Proceeds: ~$${q.value.toFixed(2)} USDT`,
+        `Profit: <b>${fmtPnl(q)}</b> (${fmtPct(q)}) <i>(before fees)</i>`,
+      ].join('\n'),
+      { parse_mode: 'HTML', reply_markup: buildPositionActionsInline(key) }
+    );
+  }
+
   // A double-tapped Close must not submit two sell orders.
   if (CLOSING_POSITIONS.has(key)) {
-    return ctx.editMessageText('⏳ Sell already in progress…', {
+    return ctx.editMessageText('Sell already in progress…', {
       reply_markup: buildPositionActionsInline(key),
     });
   }
   CLOSING_POSITIONS.add(key);
 
   await ctx.editMessageText(
-    `⏳ Selling ${pos.shares.toFixed(4)} ${side} @ ${(bid * 100).toFixed(0)}¢…`,
+    `Selling ${pos.shares.toFixed(4)} ${side} @ ${(bid * 100).toFixed(0)}¢…`,
     { reply_markup: buildPositionActionsInline(key) }
   );
 
@@ -763,9 +831,9 @@ async function closePosition(ctx: Context, key: string) {
     const result = await rt.signer.placeSell(market, side, pos.shares, bid);
 
     if (!result.success) {
-      riskManager.recordFailure(result.error || 'Sell failed');
+      riskManager.recordFailure(result.error || 'Sell failed', owner);
       return ctx.editMessageText(
-        `❌ <b>Close failed</b>\n\n${esc(result.error)}\n\nPosition abhi bhi open hai.`,
+        `❌ <b>Close failed</b>\n\n${esc(result.error)}\n\nThe position is still open.`,
         { parse_mode: 'HTML', reply_markup: buildPositionActionsInline(key) }
       );
     }
@@ -789,7 +857,7 @@ async function closePosition(ctx: Context, key: string) {
         `Order: <code>${result.orderId || result.orderHash || 'N/A'}</code>`,
         linkLine(marketUrl(pos.slug), 'Open market'),
         ``,
-        config.trading.dryRun ? '' : 'ℹ️ Fill hone ke baad 📦 Open se confirm kar lena.',
+        config.trading.dryRun ? '' : 'Check Positions after it fills.',
       ]
         .filter(Boolean)
         .join('\n'),
@@ -797,7 +865,7 @@ async function closePosition(ctx: Context, key: string) {
     );
   } catch (e: any) {
     logger.error({ err: e, key }, 'Failed to close position');
-    riskManager.recordFailure(e?.message || 'Sell error');
+    riskManager.recordFailure(e?.message || 'Sell error', owner);
     await ctx.editMessageText(`❌ <b>Close error</b>\n\n${esc(e?.message || String(e))}`, {
       parse_mode: 'HTML',
       reply_markup: buildPositionActionsInline(key),
@@ -815,7 +883,8 @@ async function placeOrder(
   outcome: 'UP' | 'DOWN',
   amountUsdt: number,
   limitPrice?: number,
-  expectedMarketId?: string
+  expectedMarketId?: string,
+  quotedPrice?: number
 ) {
   const userId = ctx.from?.id;
   const round = roundWatcher.getCurrentRound();
@@ -823,13 +892,13 @@ async function placeOrder(
 
   // Guard against a double-tapped Confirm creating two live orders.
   if (ORDERS_IN_FLIGHT.has(userId)) {
-    return ctx.reply('⏳ Pichla order abhi process ho raha hai — 2 second ruko.', {
+    return ctx.reply('Previous order is still processing. Wait a couple of seconds.', {
       reply_markup: mainKb(ctx),
     });
   }
   const waitMs = ORDER_THROTTLE_MS - (Date.now() - (LAST_ORDER_AT.get(userId) ?? 0));
   if (waitMs > 0) {
-    return ctx.reply(`⏳ Thoda ruko — ${Math.ceil(waitMs / 1000)}s baad dobara try karo.`, {
+    return ctx.reply(`Please wait ${Math.ceil(waitMs / 1000)}s and try again.`, {
       reply_markup: mainKb(ctx),
     });
   }
@@ -841,37 +910,67 @@ async function placeOrder(
   // Guard against the round rolling over between the confirm card and this
   // call: never execute a bet pinned to round X on round X+1.
   if (expectedMarketId && round.marketId !== expectedMarketId) {
-    return ctx.reply('⛔ Round changed since you confirmed — bet cancelled for safety.', {
+    return ctx.reply('Round changed since you confirmed — bet cancelled for safety.', {
       reply_markup: mainKb(ctx),
     });
   }
   if (round.isLocked) {
-    return ctx.reply('⛔ Round locked! Too late to bet.', { reply_markup: mainKb(ctx) });
+    return ctx.reply('Round locked! Too late to bet.', { reply_markup: mainKb(ctx) });
   }
   if (!round.rawMarket) {
-    return ctx.reply('❌ No live Predict.fun market synced yet. Tap 🖥️ Live.', {
+    return ctx.reply('❌ No live Predict.fun market synced yet. Tap Live.', {
       reply_markup: mainKb(ctx),
     });
   }
 
-  const { allowed, reason } = riskManager.canTrade(amountUsdt);
+  const { allowed, reason } = riskManager.canTrade(amountUsdt, userId);
   if (!allowed) {
-    return ctx.reply(`🚫 ${reason}`, { reply_markup: mainKb(ctx) });
+    return ctx.reply(`${reason}`, { reply_markup: mainKb(ctx) });
   }
 
   // Per-member daily loss cap (multi-user club mode).
   if (userId) {
     const userCheck = userRegistry.canBet(userId);
     if (!userCheck.allowed) {
-      return ctx.reply(`🚫 <b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
+      return ctx.reply(`<b>Trade Blocked</b>\n${esc(userCheck.reason)}`, {
         parse_mode: 'HTML',
         reply_markup: mainKb(ctx),
       });
     }
   }
 
+  // Price used for THIS order. `round.upPrice/downPrice` is a display value that
+  // can be several seconds old (and defaults to 50¢ when the book is empty), so a
+  // market order must be priced off the live ask in `rawMarket` — not off it.
   const marketPrice = outcome === 'UP' ? round.upPrice : round.downPrice;
-  const price = limitPrice ?? marketPrice;
+  const liveOutcome = round.rawMarket.outcomes?.find((o) => sideOfOutcome(o.name) === outcome);
+  const liveAsk = liveOutcome ? outcomeBuyPrice(liveOutcome) : null;
+
+  // `execLimit` is what the signer receives. A user-typed limit is a hard cap.
+  // For a market order it is the confirm-time price + tolerance, so the bot can
+  // never silently pay more than the price the confirm card showed.
+  let execLimit: number | undefined = limitPrice;
+  const price = limitPrice ?? liveAsk ?? marketPrice;
+  if (limitPrice == null) {
+    if (!(liveAsk && liveAsk > 0 && liveAsk < 1)) {
+      return ctx.reply(`❌ No valid ask liquidity for ${outcome} right now. Try the other side or wait.`, {
+        reply_markup: mainKb(ctx),
+      });
+    }
+    const quoted = quotedPrice ?? liveAsk;
+    const cap = marketOrderCap(
+      quoted,
+      config.trading.slippageBps,
+      priceDecimals(round.rawMarket?.decimalPrecision)
+    );
+    if (liveAsk > cap + 1e-9) {
+      return ctx.reply(
+        `⚠️ <b>Price moved</b>: ${(quoted * 100).toFixed(0)}¢ → ${(liveAsk * 100).toFixed(0)}¢.\nBet not placed. Review the new price and confirm again.`,
+        { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
+      );
+    }
+    execLimit = cap;
+  }
   if (!(price > 0) || price >= 1) {
     return ctx.reply(`❌ No valid ask liquidity for ${outcome} (price=${price}).`, {
       reply_markup: mainKb(ctx),
@@ -902,7 +1001,7 @@ async function placeOrder(
         `Price: ${(price * 100).toFixed(0)}¢`,
         `Shares: ${(amountUsdt / price).toFixed(2)}`,
         ``,
-        `ℹ️ Set <code>DRY_RUN=false</code> to place real orders.`,
+        `Set <code>DRY_RUN=false</code> to place real orders.`,
       ].join('\n'),
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
     );
@@ -911,7 +1010,7 @@ async function placeOrder(
   // Per-user runtime: balance & signing are isolated to this member's wallet.
   const rt = userId ? getUserRuntime(userId) : null;
   if (!rt) {
-    return ctx.reply('❌ Pehle /start dabao — tumhara trading account ban jayega.', {
+    return ctx.reply('Send /start first to create your account.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -930,7 +1029,7 @@ async function placeOrder(
         : amountUsdt * (1 + config.trading.slippageBps / 10000);
       if (bal.usdt + 1e-9 < needed) {
         return ctx.reply(
-          `🚫 <b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
+          `<b>Insufficient USDT balance</b>\nNeed ~$${needed.toFixed(2)}, have $${bal.usdt.toFixed(2)}.`,
           { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
         );
       }
@@ -947,7 +1046,7 @@ async function placeOrder(
     logger.warn({ err: e }, 'Could not verify balance before order — continuing');
   }
 
-  const placing = await ctx.reply('⏳ Signing &amp; submitting order...', {
+  const placing = await ctx.reply('Signing &amp; submitting order...', {
     parse_mode: 'HTML',
     reply_markup: mainKb(ctx),
   });
@@ -955,7 +1054,13 @@ async function placeOrder(
   ORDERS_IN_FLIGHT.add(userId);
   try {
     await rt.signer.init();
-    const result = await rt.signer.placeBet(round.rawMarket, outcome, amountUsdt, price);
+    const result = await rt.signer.placeBet(
+      round.rawMarket,
+      outcome,
+      amountUsdt,
+      execLimit,
+      new Date(round.endsAt)
+    );
 
     if (result.success) {
       // A placed limit order is NOT a filled position — record it unfilled and
@@ -987,7 +1092,7 @@ async function placeOrder(
           `Order ID: <code>${result.orderId || result.orderHash || 'N/A'}</code>`,
           linkLine(marketUrl(round.roundSlug), 'Open market'),
           ``,
-          `⏳ Fill confirm ho raha hai…`,
+          `Waiting for fill…`,
         ].join('\n'),
         { parse_mode: 'HTML' }
       );
@@ -995,7 +1100,7 @@ async function placeOrder(
       // Fire-and-forget fill confirmation (5s × 3 attempts).
       void confirmFillAndNotify(ctx, ctx.chat!.id, round.marketId, outcome, userId);
     } else {
-      riskManager.recordFailure(result.error || 'Unknown error');
+      riskManager.recordFailure(result.error || 'Unknown error', userId);
       await ctx.api.editMessageText(
         ctx.chat!.id,
         placing.message_id,
@@ -1004,7 +1109,7 @@ async function placeOrder(
       );
     }
   } catch (e: any) {
-    riskManager.recordFailure(e.message);
+    riskManager.recordFailure(e.message, userId);
     await ctx.api.editMessageText(
       ctx.chat!.id,
       placing.message_id,
@@ -1033,7 +1138,9 @@ async function confirmFillAndNotify(
   for (let attempt = 0; attempt < 3; attempt++) {
     await sleep(5000);
     try {
-      const positions = await rt.api.getPositions();
+      // Unresolved only: with 5-min markets, resolved rows quickly fill the
+      // single 50-row page and hide the position we are looking for.
+      const positions = await rt.api.getPositions({ isResolved: false });
       const filled = positions.some(
         (p) =>
           p.marketId === marketId &&
@@ -1045,7 +1152,7 @@ async function confirmFillAndNotify(
           await ctx.api
             .sendMessage(
               chatId,
-              `✅ <b>Order filled</b> — ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} position live. 📦 Open mein dikhega.`,
+              `✅ <b>Order filled</b> — ${outcome === 'UP' ? '🟢 UP' : '🔴 DOWN'} position live. See Positions.`,
               { parse_mode: 'HTML' }
             )
             .catch(() => {});
@@ -1059,7 +1166,7 @@ async function confirmFillAndNotify(
   await ctx.api
     .sendMessage(
       chatId,
-      `ℹ️ <b>Order abhi tak fill nahi hua</b> — limit order book mein lag sakta hai.\n📦 Open mein aadhe minute baad check karo. Unfilled order se koi funds lock nahi hote jab tak fill na ho.`,
+      `<b>Not filled yet.</b> The order may be resting on the book until the round ends.\nCheck Orders to see it or cancel it.`,
       { parse_mode: 'HTML' }
     )
     .catch(() => {});
@@ -1075,7 +1182,7 @@ export async function handleBalance(ctx: Context) {
   if (!userId) return;
   const rt = ensureUserRuntime(userId, ctx.from?.username);
   if (!rt) {
-    return ctx.reply('❌ Account wallet load nahi hua. Thodi der baad try karo.', {
+    return ctx.reply('Could not load your wallet. Try again shortly.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -1083,17 +1190,17 @@ export async function handleBalance(ctx: Context) {
   try {
     const { usdt, bnb, ok } = await rt.api.getBalance();
     if (!ok) {
-      return ctx.reply('❌ Balance fetch nahi ho paya (RPC error). Thodi der baad try karo.', {
+      return ctx.reply('Could not fetch your balance (RPC error). Try again shortly.', {
         reply_markup: mainKb(ctx),
       });
     }
     const address = rt.api.getEffectiveAddress();
     // Withdraw is private-chat only; don't render the button in a group.
     const kb =
-      ctx.chat?.type === 'private' ? new InlineKeyboard().text('💸 Withdraw', 'w:s') : undefined;
+      ctx.chat?.type === 'private' ? new InlineKeyboard().text('Withdraw', 'w:s') : undefined;
     await ctx.reply(
       [
-        `🏦 <b>Aapka Wallet</b>`,
+        `<b>Wallet</b>`,
         ``,
         `USDT: <b>$${usdt.toFixed(2)}</b>`,
         `BNB:  <b>${bnb.toFixed(4)} BNB</b> (gas)`,
@@ -1102,8 +1209,8 @@ export async function handleBalance(ctx: Context) {
         linkLine(addressUrl(address), 'View on BSCScan'),
         ``,
         ctx.chat?.type === 'private'
-          ? `💸 Withdraw karne ke liye button dabao (ya <code>/withdraw</code>).`
-          : `💸 Withdraw ke liye bot ko DM mein <code>/withdraw</code> bhejo.`,
+          ? `Tap Withdraw below (or <code>/withdraw</code>).`
+          : `To withdraw, DM the bot <code>/withdraw</code>.`,
       ]
         .filter(Boolean)
         .join('\n')
@@ -1131,20 +1238,20 @@ export async function handlePositions(ctx: Context) {
 
   const rt = ensureUserRuntime(userId, ctx.from?.username);
   if (!rt) {
-    return ctx.reply('❌ Account wallet load nahi hua. Thodi der baad try karo.', {
+    return ctx.reply('Could not load your wallet. Try again shortly.', {
       reply_markup: mainKb(ctx),
     });
   }
 
   try {
-    const positions = await rt.api.getPositions();
+    const positions = await rt.api.getPositions({ isResolved: false });
     const open = positions.filter((p) => !p.isResolved);
     if (open.length === 0) {
-      return ctx.reply('📦 No open positions found.', { reply_markup: mainKb(ctx) });
+      return ctx.reply('No open positions found.', { reply_markup: mainKb(ctx) });
     }
 
     const cached = cachePositions(chatId, open.slice(0, 10));
-    const lines = ['📦 <b>Open Positions</b>', '<i>Tap a position to view / close it.</i>', ''];
+    const lines = ['<b>Open Positions</b>', '<i>Tap a position to view / close it.</i>', ''];
 
     for (const { position: pos } of cached) {
       const title = pos.marketTitle || pos.marketId;
@@ -1196,15 +1303,18 @@ export async function handleStats(ctx: Context) {
   // Per-member stats: showing the whole club's PnL leaked other members' results.
   const stats = riskManager.getStats(userId);
   const btcState = btcPriceService.getState();
+  // Prefer the round's price (Chainlink first); the Binance feed reads 0 when
+  // Binance is unreachable/geo-blocked.
+  const btcNow = roundWatcher.getCurrentRound()?.currentPrice || btcState.currentPrice;
   const mine = userId ? userRegistry.getStats(userId) : null;
 
   const text = [
-    `📊 <b>PnL / Statistics</b>`,
+    `<b>PnL / Statistics</b>`,
     ``,
-    `BTC Price: <b>$${btcState.currentPrice.toLocaleString()}</b>`,
+    `BTC Price: <b>$${btcNow.toLocaleString()}</b>`,
     ``,
     mine
-      ? `👤 <b>Aapke:</b> ${mine.trades} trades · PnL ${mine.pnlUsd >= 0 ? '+' : ''}$${mine.pnlUsd.toFixed(2)} · Aaj ka loss $${mine.dailyLossUsd.toFixed(2)}`
+      ? `<b>You:</b> ${mine.trades} trades · PnL ${mine.pnlUsd >= 0 ? '+' : ''}$${mine.pnlUsd.toFixed(2)} · Today's loss $${mine.dailyLossUsd.toFixed(2)}`
       : '',
     `Today's Trades: ${stats.dailyTrades}`,
     `Today's Loss: $${stats.dailyLoss.toFixed(2)} / $${config.trading.dailyLossLimitUsdt}`,
@@ -1212,8 +1322,8 @@ export async function handleStats(ctx: Context) {
     `Win Rate: ${stats.winRate}%`,
     `Total PnL: ${parseFloat(stats.totalPnl) >= 0 ? '+' : ''}$${stats.totalPnl}`,
     ``,
-    `Circuit Breaker: ${stats.isTripped ? '🚨 TRIPPED — ' + stats.tripReason : '✅ Armed'}`,
-    `Mode: ${stats.isDryRun ? '🧪 DRY RUN' : '🔴 LIVE'}`,
+    `Circuit Breaker: ${stats.isTripped ? 'TRIPPED — ' + stats.tripReason : '✅ Armed'}`,
+    `Mode: ${stats.isDryRun ? 'DRY RUN' : '🔴 LIVE'}`,
     `Max Bet: $${config.trading.maxBetUsdt} USDT`,
     `Personal daily cap: $${userRegistry.userDailyLossLimit()} USDT`,
   ].join('\n');
@@ -1235,12 +1345,12 @@ export async function handleHistory(ctx: Context) {
 
   if (trades.length === 0) {
     return ctx.reply(
-      isAdmin ? '📜 No trade history yet.' : '📜 Abhi tak aapki koi trade nahi.',
+      isAdmin ? 'No trade history yet.' : 'No trades yet.',
       { reply_markup: mainKb(ctx) }
     );
   }
 
-  const lines = ['📜 <b>Recent Trades</b>', ''];
+  const lines = ['<b>Recent Trades</b>', ''];
   for (const t of [...trades].reverse()) {
     const date = new Date(t.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
     const pnlStr =
@@ -1248,7 +1358,7 @@ export async function handleHistory(ctx: Context) {
         ? t.pnlUsd >= 0
           ? `+$${t.pnlUsd.toFixed(2)} ✅`
           : `-$${Math.abs(t.pnlUsd).toFixed(2)} ❌`
-        : 'Pending ⏳';
+        : 'Pending ';
 
     lines.push(
       `${t.outcome === 'UP' ? '🟢' : '🔴'} <b>${t.outcome}</b> $${t.amountUsdt.toFixed(2)} @ ${(t.price * 100).toFixed(0)}¢  |  ${date}  |  ${pnlStr}`
@@ -1287,9 +1397,9 @@ function buildExportCard(address: string) {
     `Wallet: <code>${esc(address)}</code>`,
     ``,
     `⚠️ <b>WARNING:</b> Your private key gives FULL access to this wallet and its funds.`,
-    `Kabhi bhi kisi se share / screenshot mat karo.`,
+    `Never share it or take a screenshot.`,
     ``,
-    `Export karna hai?`,
+    `Export it?`,
   ].join('\n');
 }
 
@@ -1303,16 +1413,18 @@ async function sendKeyMessage(
   const msg = await ctx.api.sendMessage(
     chatId,
     [
-      '🔑 <b>PRIVATE KEY — HANDLE WITH CARE</b>',
+      '<b>PRIVATE KEY — HANDLE WITH CARE</b>',
       ``,
       `Address: <code>${esc(address)}</code>`,
       `Key: <code>${esc(key)}</code>`,
       ``,
-      `⏳ <b>Ye message 90 second mein auto-delete ho jayega.</b>`,
-      `⚠️ Key wallet ko drain kar sakti hai — kisi se share mat karo.`,
-      `ℹ️ Import: MetaMask / Rabby / Trust Wallet → "Import account".`,
+      `<b>This message deletes itself in 90 seconds.</b>`,
+      `Anyone with this key can drain the wallet. Do not share it.`,
+      `Import: MetaMask / Rabby / Trust Wallet → "Import account".`,
     ].join('\n'),
-    { parse_mode: 'HTML' }
+    // protect_content: Telegram blocks forwarding/saving this message, so the key
+    // cannot be leaked by a stray forward before the 90s auto-delete runs.
+    { parse_mode: 'HTML', protect_content: true }
   );
   scheduleKeyAutoDelete(ctx.api, chatId, msg.message_id);
   logger.warn(
@@ -1328,26 +1440,26 @@ export async function handleExport(ctx: Context) {
   // Keys must NEVER appear in a group chat. Even the confirm card is private.
   if (ctx.chat?.type !== 'private') {
     return ctx.reply(
-      '🔒 Private key sirf <b>private chat</b> mein export ho sakti hai.\nBot ko DM mein <code>/export</code> bhejo.',
+      'The private key can be exported in <b>private chat</b> only.\nDM the bot <code>/export</code>.',
       { parse_mode: 'HTML' }
     );
   }
 
   if (!userRegistry.hasAccess(userId)) {
-    return ctx.reply('⛔ Pehle /start dabao — account active hone ke baad hi export milega.');
+    return ctx.reply('Send /start first. Export is available once your account is active.');
   }
 
   // Every member exports their OWN wallet key (encrypted at rest).
   const { account } = userAccounts.ensureAccount(userId, ctx.from?.username);
   if (!account) {
-    return ctx.reply('❌ Wallet create nahi ho paya. Thodi der baad /start try karo.', {
+    return ctx.reply('Could not create your wallet. Try /start again shortly.', {
       reply_markup: mainKb(ctx),
     });
   }
   const key = userAccounts.getPrivateKey(userId);
   if (!key) {
     return ctx.reply(
-      '❌ Key decrypt nahi hui — admin se WALLET_MASTER_KEY check karwao (agar server migration hui hai to).',
+      'Could not decrypt the key. Ask the admin to check WALLET_MASTER_KEY (for example after a server migration).',
       { parse_mode: 'HTML', reply_markup: mainKb(ctx) }
     );
   }
@@ -1364,12 +1476,12 @@ export async function handleExport(ctx: Context) {
     if (pending && pending.code === code && Date.now() < pending.expires) {
       pendingExports.delete(userId);
       await sendKeyMessage(ctx, chatId, address, key);
-      return ctx.reply('✅ Key bhej diya. ⏳ 90 second mein delete ho jayega.', {
+      return ctx.reply('Key sent. It deletes itself in 90 seconds.', {
         parse_mode: 'HTML',
         reply_markup: mainKb(ctx),
       });
     }
-    return ctx.reply('❌ Invalid ya expired code. Naya code ke liye <code>/export</code> chalao.', {
+    return ctx.reply('Invalid or expired code. Run <code>/export</code> for a new one.', {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -1393,7 +1505,7 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
   // Never send a key into a group, even if an old card is still clickable.
   if (ctx.chat?.type !== 'private') {
     await ctx.answerCallbackQuery({
-      text: '🔒 Export sirf private chat mein — bot ko DM karo.',
+      text: 'Export works in private chat only. DM the bot.',
       show_alert: true,
     });
     return true;
@@ -1401,7 +1513,7 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
 
   const requester = Number(data.split(':')[2]);
   if (ctx.from?.id !== requester) {
-    await ctx.answerCallbackQuery({ text: '⛔ Ye card tumhara nahi hai', show_alert: true });
+    await ctx.answerCallbackQuery({ text: 'This card is not yours', show_alert: true });
     return true;
   }
 
@@ -1412,7 +1524,7 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
     pendingExports.delete(requester);
     await ctx.answerCallbackQuery({ text: 'Cancelled' });
     try {
-      await ctx.editMessageText('❌ <b>Export cancelled</b> — key bheji nahi gayi.', {
+      await ctx.editMessageText('<b>Export cancelled.</b> No key was sent.', {
         parse_mode: 'HTML',
       });
     } catch {
@@ -1434,8 +1546,8 @@ async function handleExportCallback(ctx: Context, data: string): Promise<boolean
       [
         `✅ <b>Key exported</b>`,
         ``,
-        `Key wala message upar bhej diya gaya hai.`,
-        `⏳ Wo <b>90 second</b> mein auto-delete ho jayega.`,
+        `The key message was sent above.`,
+        `It deletes itself in <b>90 seconds</b>.`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1454,7 +1566,7 @@ function isValidBscAddress(addr: string): boolean {
 }
 
 async function startWithdrawFlow(ctx: Context, userId: number, chatId: number) {
-  withdrawDrafts.set(userId, {});
+  withdrawDrafts.set(userId, { at: Date.now() });
   const rt = getUserRuntime(userId);
   let usdt: number | undefined;
   try {
@@ -1468,15 +1580,15 @@ async function startWithdrawFlow(ctx: Context, userId: number, chatId: number) {
   await ctx.api.sendMessage(
     chatId,
     [
-      `💸 <b>Withdraw USDT</b>`,
+      `<b>Withdraw USDT</b>`,
       ``,
       usdt !== undefined ? `Balance: <b>$${usdt.toFixed(2)} USDT</b>` : '',
       ``,
-      `1️⃣ Apna destination address <b>paste karo</b> (BEP-20 USDT wallet — Binance/OKX deposit address ya apna MetaMask address).`,
+      `1. Paste the destination address (a BEP-20 wallet: Binance/OKX deposit address or your own).`,
       `2️⃣ Phir amount mangege — ya <code>all</code> likh dena (sab balance).`,
-      `3️⃣ ✅ Confirm karo → USDT bhej diya jayega.`,
+      `3. Confirm to send the USDT.`,
       ``,
-      `❌ Cancel karne ke liye <code>cancel</code> likho.`,
+      `Type <code>cancel</code> to stop.`,
     ]
       .filter(Boolean)
       .join('\n'),
@@ -1488,7 +1600,7 @@ async function startWithdrawFlow(ctx: Context, userId: number, chatId: number) {
 export async function handleWithdraw(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
   if (ctx.chat?.type !== 'private') {
-    return ctx.reply('🔒 Withdraw sirf <b>private chat</b> mein hota hai. Bot ko DM karo.', {
+    return ctx.reply('Withdrawals are available in <b>private chat</b> only. DM the bot.', {
       parse_mode: 'HTML',
     });
   }
@@ -1497,7 +1609,7 @@ export async function handleWithdraw(ctx: Context) {
   if (!userId || !chatId) return;
   const rt = ensureUserRuntime(userId, ctx.from?.username);
   if (!rt) {
-    return ctx.reply('❌ Account wallet load nahi hua. Thodi der baad /start try karo.', {
+    return ctx.reply('Could not load your wallet. Try /start again shortly.', {
       reply_markup: mainKb(ctx),
     });
   }
@@ -1515,13 +1627,13 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
   // press the buttons / see the destination address).
   if (ctx.chat?.type !== 'private') {
     await ctx.answerCallbackQuery({
-      text: '🔒 Withdraw sirf private chat mein — bot ko DM karo.',
+      text: 'Withdraw works in private chat only. DM the bot.',
       show_alert: true,
     });
     return true;
   }
 
-  const draft = withdrawDrafts.get(userId);
+  const draft = getWithdrawDraft(userId);
 
   if (data === 'w:s') {
     await ctx.answerCallbackQuery();
@@ -1533,7 +1645,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
     withdrawDrafts.delete(userId);
     await ctx.answerCallbackQuery({ text: 'Cancelled' });
     try {
-      await ctx.editMessageText('❌ <b>Withdrawal cancelled</b> — kuch bheja nahi gaya.', {
+      await ctx.editMessageText('<b>Withdrawal cancelled.</b> Nothing was sent.', {
         parse_mode: 'HTML',
       });
     } catch {
@@ -1544,20 +1656,20 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
 
   // w:go — confirmed send
   if (!draft?.address || draft.amount === undefined) {
-    await ctx.answerCallbackQuery({ text: '⚠️ Flow expired — 🏦 Wallet → 💸 Withdraw se dobara', show_alert: true });
+    await ctx.answerCallbackQuery({ text: '⚠️ Flow expired — Wallet → Withdraw se dobara', show_alert: true });
     return true;
   }
 
   // Double-tapping "Confirm" must never send twice.
   if (WITHDRAW_IN_FLIGHT.has(userId)) {
-    await ctx.answerCallbackQuery({ text: '⏳ Withdrawal already in progress', show_alert: true });
+    await ctx.answerCallbackQuery({ text: 'Withdrawal already in progress', show_alert: true });
     return true;
   }
   WITHDRAW_IN_FLIGHT.add(userId);
 
   await ctx.answerCallbackQuery({ text: 'Sending…' });
   try {
-    await ctx.editMessageText('⏳ <b>Sending USDT…</b>', { parse_mode: 'HTML' }).catch(() => {});
+    await ctx.editMessageText('<b>Sending USDT…</b>', { parse_mode: 'HTML' }).catch(() => {});
   } catch {
     // ignore
   }
@@ -1576,7 +1688,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
           ? `TX: <a href="${txUrl(hash)}">${hash.slice(0, 10)}…${hash.slice(-6)}</a> ↗`
           : `TX: <code>${hash}</code>`,
         ``,
-        `ℹ️ 1-2 minute me destination par pahuch jayega.`,
+        `It should arrive in 1-2 minutes.`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1590,7 +1702,7 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
         ``,
         esc(e?.message || String(e)),
         ``,
-        `Dobara try karo: 🏦 Wallet → 💸 Withdraw`,
+        `Try again: Wallet → Withdraw`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1602,13 +1714,20 @@ async function handleWithdrawCallback(ctx: Context, data: string): Promise<boole
 
 /** Text messages typed during the withdraw flow (address / amount / cancel). */
 async function handleWithdrawText(ctx: Context, userId: number, raw: string): Promise<boolean> {
-  const draft = withdrawDrafts.get(userId);
+  const draft = getWithdrawDraft(userId);
   if (!draft) return false;
+
+  // Tapping a menu button means "leave this flow". Without this, "🖥️ Live" etc.
+  // were parsed as a wallet address and the user was stuck until typing "cancel".
+  if (MAIN_BTN_SET.has(raw.trim())) {
+    withdrawDrafts.delete(userId);
+    return false;
+  }
 
   // A flow started in DM can never be continued from a group.
   if (ctx.chat?.type !== 'private') {
     withdrawDrafts.delete(userId);
-    await ctx.reply('🔒 Withdraw sirf <b>private chat</b> mein — bot ko DM karo.', {
+    await ctx.reply('Withdrawals are available in <b>private chat</b> only. DM the bot.', {
       parse_mode: 'HTML',
     });
     return true;
@@ -1618,7 +1737,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
 
   if (text.toLowerCase() === 'cancel') {
     withdrawDrafts.delete(userId);
-    await ctx.reply('❌ <b>Withdrawal cancelled</b> — kuch bheja nahi gaya.', {
+    await ctx.reply('<b>Withdrawal cancelled.</b> Nothing was sent.', {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -1630,7 +1749,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     const addr = text.replace(/\s+/g, '');
     if (!isValidBscAddress(addr)) {
       await ctx.reply(
-        '❌ Ye valid BEP-20 address nahi lag raha (0x + 40 hex chars).\nDobara paste karo ya <code>cancel</code> likho.',
+        'That is not a valid BEP-20 address (0x + 40 hex characters).\nPaste it again or type <code>cancel</code>.',
         { parse_mode: 'HTML' }
       );
       return true;
@@ -1643,7 +1762,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
         `2️⃣ Ab <b>amount likho</b> (USDT me, e.g. <code>10</code>)`,
         `ya <code>all</code> likho — pura balance withdraw hoga.`,
         ``,
-        `<code>cancel</code> se cancel karo.`,
+        `Type <code>cancel</code> to stop.`,
       ].join('\n'),
       { parse_mode: 'HTML' }
     );
@@ -1654,7 +1773,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   const rt = getUserRuntime(userId);
   if (!rt) {
     withdrawDrafts.delete(userId);
-    await ctx.reply('❌ Account wallet load nahi hua. Dobara try karo.', {
+    await ctx.reply('Could not load your wallet. Try again.', {
       reply_markup: mainKb(ctx),
     });
     return true;
@@ -1662,7 +1781,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
   let balance = 0;
   try {
     const bal = await rt.api.getBalance();
-    if (!bal.ok) throw new Error('Balance fetch nahi hua — thodi der baad try karo');
+    if (!bal.ok) throw new Error('Could not fetch balance. Try again shortly');
     balance = bal.usdt;
   } catch (e: any) {
     withdrawDrafts.delete(userId);
@@ -1683,7 +1802,7 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     }
     if (n > balance + 1e-9) {
       await ctx.reply(
-        `❌ Wallet me sirf <b>$${balance.toFixed(2)} USDT</b> hai. Kam likho ya <code>all</code>.`,
+        `Your wallet holds only <b>$${balance.toFixed(2)} USDT</b>. Enter less, or <code>all</code>.`,
         { parse_mode: 'HTML' }
       );
       return true;
@@ -1698,13 +1817,13 @@ async function handleWithdrawText(ctx: Context, userId: number, raw: string): Pr
     .text('❌ Cancel', 'w:no');
   await ctx.reply(
     [
-      `💸 <b>Confirm Withdrawal</b>`,
+      `<b>Confirm Withdrawal</b>`,
       ``,
       `Amount: <b>${amountStr} USDT</b>`,
       `To: <code>${draft.address}</code>`,
       ``,
-      `⚠️ Sirf BEP-20 addresses pe bhej rahe hain — galat network par funds lag sakte hain.`,
-      `✅ Confirm dabao → USDT send ho jayega.`,
+      `BEP-20 addresses only. Funds sent to the wrong network can be lost.`,
+      `Tap Confirm to send the USDT.`,
     ].join('\n'),
     { parse_mode: 'HTML', reply_markup: kb }
   );
@@ -1727,6 +1846,216 @@ export async function handleReset(ctx: Context) {
 // ───────────────────────────────────────────────
 // Trend / Orderbook
 // ───────────────────────────────────────────────
+// ───────────────────────────────────────────────
+// Round card: refresh + inline bet flow
+// ───────────────────────────────────────────────
+const NOT_MODIFIED = /message is not modified/i;
+
+async function refreshRoundCard(ctx: Context) {
+  const round = roundWatcher.getCurrentRound();
+  if (!round) {
+    return ctx.answerCallbackQuery({ text: 'No active round yet' });
+  }
+  let balance: number | undefined;
+  try {
+    const userId = ctx.from?.id;
+    const rt = userId ? getUserRuntime(userId) : null;
+    if (rt) {
+      const bal = await rt.api.getBalance();
+      balance = bal.ok ? bal.usdt : undefined;
+    }
+  } catch {
+    balance = undefined;
+  }
+  try {
+    await ctx.editMessageText(buildRoundCard(round, balance), {
+      parse_mode: 'HTML',
+      reply_markup: buildRoundInline(round),
+      link_preview_options: { is_disabled: true },
+    });
+    await ctx.answerCallbackQuery();
+  } catch (e: any) {
+    // Nothing changed since the last refresh — not an error.
+    await ctx.answerCallbackQuery({ text: NOT_MODIFIED.test(String(e?.message)) ? 'Up to date' : 'Could not refresh' });
+  }
+}
+
+function parseSide(raw: string): 'UP' | 'DOWN' | null {
+  return raw === 'UP' || raw === 'DOWN' ? raw : null;
+}
+
+async function inlineBetSide(ctx: Context, raw: string) {
+  const side = parseSide(raw);
+  const userId = ctx.from?.id;
+  if (!side || !userId) return ctx.answerCallbackQuery();
+  const round = roundWatcher.getCurrentRound();
+  if (!round || round.isLocked) {
+    return ctx.answerCallbackQuery({ text: 'Betting is locked for this round', show_alert: true });
+  }
+  betDraft.set(userId, { outcome: side });
+  await ctx.answerCallbackQuery();
+  const price = side === 'UP' ? round.upPrice : round.downPrice;
+  await ctx.editMessageText(`<b>${side}</b> at ${(price * 100).toFixed(0)}¢\nChoose an amount.`, {
+    parse_mode: 'HTML',
+    reply_markup: buildAmountInline(side),
+  });
+}
+
+async function inlineBetAmount(ctx: Context, rest: string) {
+  const [rawSide, rawAmount] = rest.split(':');
+  const side = parseSide(rawSide);
+  const amount = Number(rawAmount);
+  if (!side || !Number.isFinite(amount) || amount <= 0) return ctx.answerCallbackQuery();
+  await ctx.answerCallbackQuery();
+  return showConfirm(ctx, side, amount);
+}
+
+async function inlineBetCustom(ctx: Context, raw: string) {
+  const side = parseSide(raw);
+  const userId = ctx.from?.id;
+  if (!side || !userId) return ctx.answerCallbackQuery();
+  betDraft.set(userId, { outcome: side, awaitingCustom: true });
+  await ctx.answerCallbackQuery();
+  await ctx.reply(`Type your <b>${side}</b> amount in USDT, e.g. <code>25.5</code>`, {
+    parse_mode: 'HTML',
+    reply_markup: mainKb(ctx),
+  });
+}
+
+// ───────────────────────────────────────────────
+// /orders  (resting orders: list, cancel one, cancel all)
+// ───────────────────────────────────────────────
+interface CachedOrder {
+  chatId: number;
+  userId: number;
+  orderId: string;
+  expires: number;
+}
+const orderCache: Map<string, CachedOrder> = new Map();
+const ORDER_CACHE_TTL_MS = 10 * 60_000;
+
+function pruneOrderCache() {
+  const now = Date.now();
+  for (const [k, v] of orderCache) if (v.expires < now) orderCache.delete(k);
+}
+
+/** What a resting order is, in plain words: "BUY UP 5.00 sh @ 54¢". */
+function describeOrder(o: OpenOrder): string {
+  const round = roundWatcher.getCurrentRound();
+  const outcome = round?.rawMarket?.outcomes.find(
+    (x) => o.tokenId && String(x.onChainId || x.tokenId || '') === o.tokenId
+  );
+  const side = outcome ? sideOfOutcome(outcome.name) : null;
+  const maker = Number(o.makerAmount);
+  const taker = Number(o.takerAmount);
+  // BUY: maker pays USDT, taker is shares. SELL: the reverse.
+  const shares = (o.side === 'BUY' ? taker : maker) / 1e18;
+  const price =
+    maker > 0 && taker > 0 ? (o.side === 'BUY' ? maker / taker : taker / maker) : NaN;
+  const parts = [o.side, side ?? 'prev. round'];
+  if (Number.isFinite(shares) && shares > 0) parts.push(`${shares.toFixed(2)} sh`);
+  if (Number.isFinite(price) && price > 0 && price < 1) parts.push(`@ ${(price * 100).toFixed(0)}¢`);
+  return parts.join(' ');
+}
+
+export async function handleOrders(ctx: Context) {
+  if (!isAllowed(ctx)) return notAllowed(ctx);
+  const userId = ctx.from?.id;
+  const chatId = ctx.chat?.id;
+  if (!userId || !chatId) return;
+  const rt = ensureUserRuntime(userId, ctx.from?.username);
+  if (!rt) {
+    return ctx.reply('Could not load your wallet. Try again shortly.', { reply_markup: mainKb(ctx) });
+  }
+
+  let orders: OpenOrder[];
+  try {
+    orders = await rt.api.getOpenOrders();
+  } catch (e: any) {
+    return ctx.reply(`Could not load orders: ${esc(e?.message)}`, {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
+  }
+
+  if (orders.length === 0) {
+    return ctx.reply('No resting orders.', { reply_markup: mainKb(ctx) });
+  }
+
+  pruneOrderCache();
+  const shown = orders.slice(0, 8);
+  const kb = new InlineKeyboard();
+  const lines = ['<b>Resting orders</b>', '<i>Unfilled orders waiting on the book.</i>', ''];
+  for (const o of shown) {
+    const key = crypto.randomBytes(5).toString('hex');
+    orderCache.set(key, { chatId, userId, orderId: o.id, expires: Date.now() + ORDER_CACHE_TTL_MS });
+    const label = describeOrder(o);
+    const filled = o.shares > 0 && o.filledShares > 0 ? ` · ${Math.round((o.filledShares / o.shares) * 100)}% filled` : '';
+    lines.push(`${esc(label)}${filled}`);
+    kb.text(`Cancel · ${label}`.slice(0, 40), `o:c:${key}`).row();
+  }
+  if (orders.length > shown.length) lines.push('', `+${orders.length - shown.length} more`);
+  if (orders.length > 1) kb.text('Cancel all', 'o:a').row();
+  kb.text('Refresh', 'o:l');
+
+  await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: kb });
+}
+
+function describeRemoval(r: { removed: string[]; noop: string[]; rejected: string[] }): string {
+  const bits: string[] = [];
+  if (r.removed.length) bits.push(`${r.removed.length} cancelled`);
+  if (r.noop.length) bits.push(`${r.noop.length} already filled or closed`);
+  if (r.rejected.length) bits.push(`${r.rejected.length} cannot be cancelled yet (try again shortly)`);
+  return bits.join(', ') || 'Nothing to cancel';
+}
+
+async function cancelOneOrder(ctx: Context, key: string) {
+  const cached = orderCache.get(key);
+  const userId = ctx.from?.id;
+  if (!cached || cached.userId !== userId || cached.chatId !== ctx.chat?.id || cached.expires < Date.now()) {
+    return ctx.answerCallbackQuery({ text: 'List expired. Open Orders again.', show_alert: true });
+  }
+  const rt = userId ? getUserRuntime(userId) : null;
+  if (!rt) return ctx.answerCallbackQuery({ text: 'Wallet not available', show_alert: true });
+
+  await ctx.answerCallbackQuery({ text: 'Cancelling…' });
+  const res = await rt.api.removeOrders([cached.orderId]);
+  if (!res.success) {
+    return ctx.reply(`Could not cancel: ${esc(res.error)}`, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  }
+  orderCache.delete(key);
+  await ctx.reply(describeRemoval(res) + '.', { reply_markup: mainKb(ctx) });
+  try {
+    await ctx.deleteMessage();
+  } catch {
+    // ignore
+  }
+  return handleOrders(ctx);
+}
+
+async function cancelAllOrders(ctx: Context) {
+  const userId = ctx.from?.id;
+  const rt = userId ? getUserRuntime(userId) : null;
+  if (!userId || !rt) return ctx.answerCallbackQuery({ text: 'Wallet not available', show_alert: true });
+  await ctx.answerCallbackQuery({ text: 'Cancelling…' });
+  let orders: OpenOrder[];
+  try {
+    orders = await rt.api.getOpenOrders();
+  } catch (e: any) {
+    return ctx.reply(`Could not load orders: ${esc(e?.message)}`, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  }
+  const res = await rt.api.removeOrders(orders.map((o) => o.id));
+  if (!res.success) {
+    return ctx.reply(`Could not cancel: ${esc(res.error)}`, { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+  }
+  await ctx.reply(describeRemoval(res) + '.', { reply_markup: mainKb(ctx) });
+  try {
+    await ctx.deleteMessage();
+  } catch {
+    // ignore
+  }
+}
+
 export async function handleOrderbook(ctx: Context) {
   if (!isAllowed(ctx)) return notAllowed(ctx);
   const round = roundWatcher.getCurrentRound();
@@ -1734,49 +2063,44 @@ export async function handleOrderbook(ctx: Context) {
     return ctx.reply('No active round found.', { reply_markup: mainKb(ctx) });
   }
 
-  const trendEmoji = round.currentTrend === 'UP' ? '🟢' : round.currentTrend === 'DOWN' ? '🔴' : '⚪';
   const lockKnown = round.lockPrice > 0;
   const header = [
-    `📈 <b>Trend</b>`,
+    `<b>Book</b>  ·  ${esc(round.title)}`,
     lockKnown
-      ? `${trendEmoji} BTC vs lock: ${round.priceDiff >= 0 ? '+' : ''}$${round.priceDiff.toFixed(2)}`
-      : `⏳ Lock price still syncing…`,
-    lockKnown
-      ? `Lock $${round.lockPrice.toFixed(2)} → Now $${round.currentPrice.toFixed(2)}`
-      : `Now $${round.currentPrice.toFixed(2)}`,
+      ? `BTC ${round.priceDiff >= 0 ? '+' : '-'}$${Math.abs(round.priceDiff).toFixed(2)} vs lock ($${round.lockPrice.toFixed(2)} → $${round.currentPrice.toFixed(2)})`
+      : `Lock price syncing… now $${round.currentPrice.toFixed(2)}`,
     '',
   ].join('\n');
 
   try {
     const ob = await predictFunApi.getOrderbook(round.marketId);
     if (!ob) {
-      return ctx.reply(header + 'Orderbook not available for current market.', {
+      return ctx.reply(header + 'Order book is not available right now.', {
         parse_mode: 'HTML',
         reply_markup: mainKb(ctx),
       });
     }
 
-    // Predict.fun returns levels as `[price, size]` tuples; accept objects too.
-    const formatLevel = (lvl: { price: number; size: number } | [number, number]) => {
-      const price = Array.isArray(lvl) ? Number(lvl[0]) : Number(lvl.price);
-      const size = Array.isArray(lvl) ? Number(lvl[1]) : Number(lvl.size);
-      return `  ${(price * 100).toFixed(1)}¢  |  ${size.toFixed(2)} shares`;
+    const { up, down } = splitBooks(ob.asks as any, ob.bids as any);
+    const fmt = (l: { price: number; size: number }) =>
+      `${(l.price * 100).toFixed(1).padStart(5)}¢  ${l.size.toFixed(2).padStart(10)} sh`;
+    const side = (title: string, book: { asks: any[]; bids: any[] }) => {
+      const asks = book.asks.slice(0, 3).map(fmt).reverse();
+      const bids = book.bids.slice(0, 3).map(fmt);
+      return [
+        `<b>${title}</b>`,
+        '<pre>' +
+          [...(asks.length ? asks.map((l) => `ask ${l}`) : ['ask  none']), ...(bids.length ? bids.map((l) => `bid ${l}`) : ['bid  none'])].join('\n') +
+          '</pre>',
+      ].join('\n');
     };
 
-    const lines = [
-      header,
-      `📊 <b>Orderbook — ${esc(round.title)}</b>`,
-      ``,
-      `<b>ASKS:</b>`,
-      ...(ob.asks || []).slice(0, 5).reverse().map(formatLevel),
-      `———`,
-      `<b>BIDS:</b>`,
-      ...(ob.bids || []).slice(0, 5).map(formatLevel),
-    ];
-
-    await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', reply_markup: mainKb(ctx) });
+    await ctx.reply([header, side('UP', up), side('DOWN', down)].join('\n'), {
+      parse_mode: 'HTML',
+      reply_markup: mainKb(ctx),
+    });
   } catch (e: any) {
-    await ctx.reply(`❌ Error: ${esc(e.message)}`, {
+    await ctx.reply(`Could not load the book: ${esc(e.message)}`, {
       parse_mode: 'HTML',
       reply_markup: mainKb(ctx),
     });
@@ -1791,8 +2115,8 @@ async function handlePauseToggle(ctx: Context) {
   setNotifyPaused(chatId, next);
   await ctx.reply(
     next
-      ? '◾ <b>Paused</b> — round alerts muted. Tap ▶️ Resume anytime.'
-      : '▶️ <b>Resumed</b> — round alerts enabled again.',
+      ? '<b>Alerts muted.</b> Tap Unmute alerts anytime.'
+      : '<b>Alerts on.</b>',
     { parse_mode: 'HTML', reply_markup: buildMainKeyboard(next) }
   );
 }
@@ -1800,19 +2124,19 @@ async function handlePauseToggle(ctx: Context) {
 async function startQuickBet(ctx: Context) {
   const round = roundWatcher.getCurrentRound();
   if (!round) {
-    return ctx.reply('⏳ No active round yet. Tap 🖥️ Live in a moment.', {
+    return ctx.reply('No active round yet. Tap Live in a moment.', {
       reply_markup: mainKb(ctx),
     });
   }
   if (round.isLocked) {
-    return ctx.reply('⛔ Round locked — wait for the next round.', {
+    return ctx.reply('Round locked — wait for the next round.', {
       reply_markup: mainKb(ctx),
     });
   }
   if (ctx.from?.id) {
     betDraft.set(ctx.from.id, {});
   }
-  await ctx.reply('⚡ <b>Quick Bet</b> — pick a side:', {
+  await ctx.reply('<b>Quick bet</b>: pick a side.', {
     parse_mode: 'HTML',
     reply_markup: buildSideKeyboard(),
   });
@@ -1834,8 +2158,12 @@ export async function handleTextMessage(ctx: Context) {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const text = ctx.message?.text?.trim() || '';
+  let text = ctx.message?.text?.trim() || '';
   if (!text || text.startsWith('/')) return;
+  // Taps from a keyboard sent by an older version of the bot.
+  const legacy = LEGACY_BTN[text];
+  if (legacy === '/help') return handleHelp(ctx);
+  if (legacy) text = legacy;
 
   // Withdrawal flow input (address / amount / cancel) takes priority over
   // bet parsing — an amount like "10" would otherwise become a bet.
@@ -1864,7 +2192,7 @@ export async function handleTextMessage(ctx: Context) {
   // Custom amount numeric entry
   if (draft?.awaitingCustom && !isKnownButton) {
     const amount = parseFloat(text);
-    if (isNaN(amount) || amount <= 0) {
+    if (!Number.isFinite(amount) || amount <= 0) {
       return ctx.reply(
         '❌ Invalid amount. Enter a number like <code>10</code> or <code>25.5</code>',
         { parse_mode: 'HTML', reply_markup: buildAmountKeyboard() }
@@ -1880,17 +2208,17 @@ export async function handleTextMessage(ctx: Context) {
 
   // Confirm / Cancel while draft has amount
   if (text === BTN.CONFIRM && draft?.outcome && draft.amountUsdt) {
-    const { outcome, amountUsdt, limitPrice, marketId } = draft;
+    const { outcome, amountUsdt, limitPrice, marketId, quotedPrice } = draft;
     clearDraft(userId);
 
     // The round may have rolled over between the confirm card and the tap.
     const current = roundWatcher.getCurrentRound();
     if (!marketId || !current || current.marketId !== marketId) {
-      return ctx.reply('⛔ Round has changed — please start a new bet.', {
+      return ctx.reply('Round has changed — please start a new bet.', {
         reply_markup: mainKb(ctx),
       });
     }
-    return placeOrder(ctx, outcome, amountUsdt, limitPrice, marketId);
+    return placeOrder(ctx, outcome, amountUsdt, limitPrice, marketId, quotedPrice);
   }
   if (text === BTN.CANCEL && draft) {
     clearDraft(userId);
@@ -1942,8 +2270,8 @@ export async function handleTextMessage(ctx: Context) {
       return handleHistory(ctx);
     case BTN.TREND:
       return handleOrderbook(ctx);
-    case BTN.SYSTEM:
-      return handleHelp(ctx);
+    case BTN.ORDERS:
+      return handleOrders(ctx);
     case BTN.QUICK_BET:
       return startQuickBet(ctx);
     case BTN.PNL:

@@ -4,3 +4,7 @@ data/
 .env
 .env.*.tmp
 *.log
+
+# Any env file except the example template
+.env.*
+!.env.example

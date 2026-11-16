@@ -25,7 +25,11 @@ function parsePositiveInt(value: string | undefined, fallback: number, max: numb
 const MAX_USERS = parsePositiveInt(process.env.MAX_USERS, 10, 10_000);
 /** Per-member daily loss cap; falls back to the global limit. */
 const USER_DAILY_LOSS_LIMIT_USDT = (() => {
-  const n = Number(process.env.USER_DAILY_LOSS_LIMIT_USDT);
+  const raw = (process.env.USER_DAILY_LOSS_LIMIT_USDT ?? '').trim();
+  // `Number('')` is 0, which would silently DISABLE the personal cap for a blank
+  // `USER_DAILY_LOSS_LIMIT_USDT=` line. Only an explicit number counts.
+  if (raw === '') return config.trading.dailyLossLimitUsdt;
+  const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : config.trading.dailyLossLimitUsdt;
 })();
 
@@ -169,11 +173,23 @@ class UserRegistry {
     }
   }
 
-  /** Env whitelist users become permanent admins (file entries are kept in sync). */
+  /**
+   * The env whitelist is the single source of truth for admins: listed ids are
+   * promoted, and ids that were removed from the env are DEMOTED again.
+   * (Before, an admin stayed admin forever in users.json even after being
+   * removed from TELEGRAM_ALLOWED_USERS.)
+   */
   private seedAdmins() {
     const adminIds = new Set<number>(config.telegram.allowedUsers);
     const extra = Number(process.env.TELEGRAM_ADMIN_ID);
     if (Number.isFinite(extra) && extra > 0) adminIds.add(extra);
+
+    for (const u of this.users) {
+      if (u.role === 'admin' && !adminIds.has(u.telegramId)) {
+        u.role = 'user';
+        logger.warn({ telegramId: u.telegramId }, 'Admin removed from env — demoted to member');
+      }
+    }
 
     for (const id of adminIds) {
       let u = this.users.find((x) => x.telegramId === id);
@@ -289,12 +305,12 @@ class UserRegistry {
   }
 
   /** Restore access for a blocked member. */
-  public unban(telegramId: number): 'admin' | 'ok' | 'notfound' | 'notblocked' {
+  public unban(telegramId: number): 'admin' | 'ok' | 'notfound' | 'notblocked' | 'full' {
     const u = this.get(telegramId);
     if (!u) return 'notfound';
     if (u.role === 'admin') return 'admin';
     if (u.status !== 'blocked') return 'notblocked';
-    if (this.memberCount() >= MAX_USERS) return 'notfound';
+    if (this.memberCount() >= MAX_USERS) return 'full';
     u.status = 'active';
     this.save();
     logger.info({ telegramId }, 'User unbanned by admin');
@@ -321,7 +337,7 @@ class UserRegistry {
     if (USER_DAILY_LOSS_LIMIT_USDT > 0 && u.stats.dailyLossUsd >= USER_DAILY_LOSS_LIMIT_USDT) {
       return {
         allowed: false,
-        reason: `Aaj ka personal loss limit hit ho gaya ($${u.stats.dailyLossUsd.toFixed(2)} / $${USER_DAILY_LOSS_LIMIT_USDT}). Kal phir try karna.`,
+        reason: `Daily personal loss limit reached ($${u.stats.dailyLossUsd.toFixed(2)} / $${USER_DAILY_LOSS_LIMIT_USDT}). Try again tomorrow.`,
       };
     }
     return { allowed: true };

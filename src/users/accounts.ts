@@ -90,11 +90,11 @@ function writeFileAtomic(file: string, contents: string, mode = 0o600) {
   }
 }
 
-function readOrCreateFileKey(): string | null {
+function readOrCreateFileKey(): { key: string; generated: boolean } | null {
   try {
     if (fs.existsSync(masterKeyFile())) {
       const key = fs.readFileSync(masterKeyFile(), 'utf8').trim();
-      if (key.length >= 32) return key;
+      if (key.length >= 32) return { key, generated: false };
       logger.error(
         { file: masterKeyFile() },
         '⚠️  data/master.key is too short — refusing to use it'
@@ -107,11 +107,57 @@ function readOrCreateFileKey(): string | null {
       { file: masterKeyFile() },
       '🔐 Generated data/master.key — BACK IT UP. Losing it makes member wallet keys unrecoverable.'
     );
-    return key;
+    return { key, generated: true };
   } catch (e) {
     logger.error({ err: e, file: masterKeyFile() }, 'Could not create data/master.key');
     return null;
   }
+}
+
+/**
+ * Safety net for a freshly generated master key: if accounts.json already holds
+ * encrypted wallets, at least one of them must decrypt with the keys we will
+ * use. Otherwise master.key was lost/replaced, and silently carrying on would
+ * lock every member out of their funds (and encrypt new wallets with a key
+ * that cannot read the old ones).
+ */
+function assertExistingAccountsDecryptable(keys: Buffer[]): void {
+  const file = accountsFile();
+  if (!fs.existsSync(file)) return;
+
+  let accounts: Record<string, UserAccount> = {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as AccountsFile;
+    accounts = raw?.accounts && typeof raw.accounts === 'object' ? raw.accounts : {};
+  } catch {
+    // Unparseable file is reported by UserAccounts.load() with its own error.
+    return;
+  }
+
+  const entries = Object.values(accounts);
+  if (entries.length === 0) return;
+
+  const ok = entries.some((acc) => {
+    try {
+      decryptWith(keys, acc.enc, acc.telegramId);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (ok) return;
+
+  // Remove the key we just generated so the NEXT start does not trust it.
+  try {
+    fs.unlinkSync(masterKeyFile());
+  } catch {
+    // ignore
+  }
+  throw new Error(
+    `accounts.json contains ${entries.length} encrypted wallet(s) but none can be decrypted: ` +
+      'data/master.key is missing. Restore the original data/master.key or set the original ' +
+      'WALLET_MASTER_KEY, then start again. (A new key was NOT kept.)'
+  );
 }
 
 let primaryKey: Buffer | null = null;
@@ -125,6 +171,7 @@ function resolveKeys(): { primary: Buffer; all: Buffer[] } {
   if (!primaryKey || !decryptKeys) {
     const envKey = (process.env.WALLET_MASTER_KEY || '').trim();
     let secret: string;
+    let generatedKeyFile = false;
     if (envKey) {
       secret = envKey;
     } else {
@@ -134,14 +181,15 @@ function resolveKeys(): { primary: Buffer; all: Buffer[] } {
           'No wallet encryption key available. Set WALLET_MASTER_KEY (recommended) or allow the bot to create data/master.key.'
         );
       }
-      secret = fileKey;
+      secret = fileKey.key;
+      generatedKeyFile = fileKey.generated;
       logger.warn(
         'WALLET_MASTER_KEY is not set — using data/master.key. Back it up; without it user keys cannot be decrypted.'
       );
     }
 
-    primaryKey = deriveKey(secret);
-    const all = [primaryKey];
+    const primary = deriveKey(secret);
+    const all = [primary];
 
     // Backward compatibility: early builds derived the key from the Telegram
     // bot token. Keep that as a *decrypt-only* fallback for existing accounts.
@@ -152,6 +200,11 @@ function resolveKeys(): { primary: Buffer; all: Buffer[] } {
       // decryptable by anyone. Removed deliberately.
     }
 
+    // A brand-new master.key next to existing encrypted wallets means the old
+    // key was lost — fail loudly instead of locking everyone out.
+    if (generatedKeyFile) assertExistingAccountsDecryptable(all);
+
+    primaryKey = primary;
     decryptKeys = all;
   }
   return { primary: primaryKey, all: decryptKeys };
@@ -176,7 +229,10 @@ function encrypt(plain: string, telegramId: number): EncKey {
 }
 
 function decrypt(enc: EncKey, telegramId: number): string {
-  const { all } = resolveKeys();
+  return decryptWith(resolveKeys().all, enc, telegramId);
+}
+
+function decryptWith(all: Buffer[], enc: EncKey, telegramId: number): string {
   const iv = Buffer.from(enc.iv, 'hex');
   const tag = Buffer.from(enc.tag, 'hex');
   const data = Buffer.from(enc.data, 'hex');
@@ -204,11 +260,24 @@ class UserAccounts {
   private accounts: Record<string, UserAccount> = {};
   private loaded = false;
 
+  /**
+   * Load accounts.json eagerly at startup so a bad key store stops the bot
+   * immediately (instead of failing later, inside a user's command).
+   */
+  public init() {
+    this.load();
+    // Resolve (and, for a new install, create) the encryption key now, so a lost
+    // master.key is detected at startup rather than on the first /start.
+    resolveKeys();
+  }
+
   private load() {
     if (this.loaded) return;
-    this.loaded = true;
     const file = accountsFile();
-    if (!fs.existsSync(file)) return;
+    if (!fs.existsSync(file)) {
+      this.loaded = true;
+      return;
+    }
 
     try {
       const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as AccountsFile;
@@ -216,37 +285,38 @@ class UserAccounts {
         throw new Error('accounts.json has an unexpected shape');
       }
       this.accounts = raw.accounts;
+      this.loaded = true;
       logger.info(
         { file, accounts: Object.keys(this.accounts).length },
         'Loaded user accounts'
       );
     } catch (e) {
-      // Never overwrite a corrupt key file: keep it for manual recovery and
-      // start with an empty in-memory map. Otherwise the next save would
-      // permanently destroy every member's private key.
+      // FAIL CLOSED. Starting with an empty map would hand every existing
+      // member a brand-new wallet on /start and abandon their funded one.
+      // Keep a copy for manual recovery and refuse to run until it is fixed.
       const backup = `${file}.corrupt-${Date.now()}`;
       try {
-        fs.renameSync(file, backup);
-        logger.error(
-          { err: e, file, backup },
-          '⚠️  accounts.json could not be parsed — moved to backup and starting fresh'
-        );
-      } catch (renameError) {
-        logger.error(
-          { err: e, err2: renameError, file },
-          '⚠️  accounts.json is corrupt and could not be moved — refusing to touch it'
-        );
+        fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+      } catch {
+        // best effort — the original file is left untouched either way
       }
-      this.accounts = {};
+      logger.error(
+        { err: e, file, backup },
+        '⚠️  accounts.json could not be parsed — refusing to start. Restore it from a backup or fix the JSON.'
+      );
+      throw new Error(`accounts.json is unreadable (${file}). Fix or restore it before starting the bot.`);
     }
   }
 
-  private save() {
+  /** @returns false when the file could not be written (callers must handle it). */
+  private save(): boolean {
     try {
       const payload: AccountsFile = { version: 2, accounts: this.accounts };
       writeFileAtomic(accountsFile(), JSON.stringify(payload, null, 2));
+      return true;
     } catch (e) {
       logger.error({ err: e, file: accountsFile() }, 'Failed to persist user accounts');
+      return false;
     }
   }
 
@@ -277,7 +347,14 @@ class UserAccounts {
         enc: encrypt(wallet.privateKey, telegramId),
       };
       this.accounts[key] = account;
-      this.save();
+      // The user is about to be told "send funds to this address". If the key
+      // is not safely on disk, a restart would lose it and those funds with it —
+      // so never hand out an address we could not persist.
+      if (!this.save()) {
+        delete this.accounts[key];
+        logger.error({ telegramId }, 'Wallet NOT created: could not persist accounts.json');
+        return { account: null, created: false };
+      }
       logger.info({ telegramId, address: account.address }, '🆕 New per-user trading wallet created');
       return { account, created: true };
     } catch (e) {
@@ -341,15 +418,17 @@ class UserAccounts {
     const pk = this.getPrivateKey(telegramId);
     if (!pk) throw new Error('Account wallet not found');
 
-    if (!ethers.isAddress(to)) {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(to) || !ethers.isAddress(to)) {
       throw new Error('Invalid destination address');
     }
+    // Normalised (checksummed) form; also rejects bad mixed-case checksums above.
+    const dest = ethers.getAddress(to);
     const wallet = new ethers.Wallet(pk, getProvider());
-    if (to.toLowerCase() === wallet.address.toLowerCase()) {
-      throw new Error('Apne hi wallet mein withdraw nahi kar sakte');
+    if (dest === wallet.address) {
+      throw new Error('Cannot withdraw to the same wallet');
     }
-    if (to === ethers.ZeroAddress) {
-      throw new Error('Zero address par withdraw nahi kar sakte');
+    if (dest === ethers.ZeroAddress) {
+      throw new Error('Cannot withdraw to the zero address');
     }
 
     const usdtAddress = config.predictfun.isTestnet
@@ -368,35 +447,61 @@ class UserAccounts {
     const decimals = Number(decimalsRaw);
     const balance = Number(ethers.formatUnits(balRaw, decimals));
 
-    const requested = amountUsdt === 'all' ? balance : amountUsdt;
-    if (!Number.isFinite(requested) || requested <= 0) {
-      throw new Error(`Wallet mein $${balance.toFixed(2)} USDT hai`);
+    // Work in raw token units. Going through a JS float (the old behaviour)
+    // could produce a value 1 wei ABOVE the balance for "all" and make the
+    // transfer revert, or leave dust behind.
+    let value: bigint;
+    if (amountUsdt === 'all') {
+      value = balRaw as bigint;
+    } else {
+      if (!Number.isFinite(amountUsdt) || amountUsdt <= 0) {
+        throw new Error(`Wallet holds $${balance.toFixed(2)} USDT`);
+      }
+      value = ethers.parseUnits(amountUsdt.toFixed(Math.min(decimals, 18)), decimals);
+      if (value > (balRaw as bigint)) {
+        throw new Error(`Only $${balance.toFixed(2)} USDT available`);
+      }
     }
-    if (requested > balance + 1e-9) {
-      throw new Error(`Sirf $${balance.toFixed(2)} USDT available hai`);
+    if (value <= 0n) {
+      throw new Error(
+        amountUsdt === 'all'
+          ? `Wallet holds $${balance.toFixed(2)} USDT`
+          : 'Amount is too small to withdraw'
+      );
     }
 
     // BEP-20 transfer needs BNB for gas — fail early with a clear message.
     const gasBal = await getProvider().getBalance(wallet.address);
     if (gasBal < ethers.parseEther('0.00012')) {
       throw new Error(
-        'Withdrawal ke liye gas (BNB) kam hai — pehle thoda BNB is wallet mein bhejo.'
+        'Not enough BNB for gas. Send a little BNB to this wallet first.'
       );
     }
 
-    // Never round *up* past the user's balance.
-    const safeAmount = Math.min(requested, balance);
-    const value = ethers.parseUnits(safeAmount.toFixed(Math.min(decimals, 18)), decimals);
-    if (value <= 0n) throw new Error('Amount is too small to withdraw');
+    const tx = await usdt.transfer(dest, value);
 
-    const tx = await usdt.transfer(to, value);
-    const receipt = await tx.wait();
+    // Bounded wait: this runs inside a Telegram handler, so a stuck transaction
+    // must not hang the bot indefinitely.
+    let receipt;
+    try {
+      receipt = await tx.wait(1, 90_000);
+    } catch (e: any) {
+      if (e?.code === 'TIMEOUT') {
+        throw new Error(
+          `Transaction not confirmed yet. Hash: ${tx.hash}. Check BSCScan and do NOT withdraw again until it confirms or fails.`
+        );
+      }
+      throw e;
+    }
     if (receipt && receipt.status === 0) {
       throw new Error('Withdrawal transaction reverted on-chain');
     }
 
     const hash = receipt?.hash || tx.hash;
-    logger.info({ telegramId, to, amount: safeAmount, hash }, 'User USDT withdrawal sent');
+    logger.info(
+      { telegramId, to: dest, amount: ethers.formatUnits(value, decimals), hash },
+      'User USDT withdrawal sent'
+    );
     return hash;
   }
 }
